@@ -16,8 +16,7 @@ uploads/
 *.dll
 *.so
 *.dylib
-server
-main
+
 
 # Test binaries
 *.test
