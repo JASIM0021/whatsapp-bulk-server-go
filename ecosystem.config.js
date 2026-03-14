@@ -29,8 +29,7 @@ module.exports = {
         RATE_LIMIT_MIN_DELAY: 3000,
         RATE_LIMIT_MAX_DELAY: 5000,
       },
-      error_file: './logs/error.log',
-      out_file: './logs/output.log',
+      // Use PM2 default logs location (~/.pm2/logs/)
       log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
       merge_logs: true,
       min_uptime: '10s',
