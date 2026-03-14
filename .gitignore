@@ -1,0 +1,43 @@
+# Environment variables
+.env
+
+# WhatsApp session data
+*.db
+*.db-shm
+*.db-wal
+whatsapp_session.db*
+
+# Upload directory
+uploads/
+
+# Go binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+server
+main
+
+# Test binaries
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
