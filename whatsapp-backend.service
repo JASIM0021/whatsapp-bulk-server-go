@@ -6,8 +6,8 @@ After=network.target
 Type=simple
 User=ubuntu
 Group=ubuntu
-WorkingDirectory=/home/ubuntu/whatsapp-bulk-sender/backend-go
-ExecStart=/home/ubuntu/whatsapp-bulk-sender/backend-go/server
+WorkingDirectory=/home/ubuntu/whatsapp-bulk-server-go
+ExecStart=/home/ubuntu/whatsapp-bulk-server-go/server
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -17,7 +17,7 @@ SyslogIdentifier=whatsapp-backend
 # Environment variables
 Environment="PORT=4000"
 Environment="NODE_ENV=production"
-Environment="FRONTEND_URL=https://your-frontend-domain.com"
+Environment="FRONTEND_URL=https://whatsapp-bulk-ui.vercel.app"
 Environment="WHATSAPP_SESSION_PATH=/var/lib/whatsapp/session.db"
 Environment="UPLOAD_DIR=/var/lib/whatsapp/uploads"
 Environment="MAX_FILE_SIZE=10485760"

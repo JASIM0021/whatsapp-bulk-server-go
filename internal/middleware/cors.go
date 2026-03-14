@@ -21,11 +21,28 @@ func CORS(next http.Handler) http.Handler {
 		}
 
 		origin := r.Header.Get("Origin")
+		allowed := false
+
+		// Check if origin is allowed
 		for _, allowedOrigin := range allowedOrigins {
-			if origin == allowedOrigin || strings.HasPrefix(origin, "http://localhost:") {
-				w.Header().Set("Access-Control-Allow-Origin", origin)
+			if origin == allowedOrigin {
+				allowed = true
 				break
 			}
+		}
+
+		// Also allow localhost on any port and Vercel preview deployments
+		if !allowed {
+			if strings.HasPrefix(origin, "http://localhost:") ||
+				strings.HasPrefix(origin, "https://localhost:") ||
+				strings.HasSuffix(origin, ".vercel.app") {
+				allowed = true
+			}
+		}
+
+		// Set CORS headers if origin is allowed
+		if allowed {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
 		}
 
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
