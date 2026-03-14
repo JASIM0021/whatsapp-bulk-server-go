@@ -1,0 +1,39 @@
+[Unit]
+Description=WhatsApp Bulk Sender Backend
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/whatsapp-bulk-sender/backend-go
+ExecStart=/home/ubuntu/whatsapp-bulk-sender/backend-go/server
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=whatsapp-backend
+
+# Environment variables
+Environment="PORT=4000"
+Environment="NODE_ENV=production"
+Environment="FRONTEND_URL=https://your-frontend-domain.com"
+Environment="WHATSAPP_SESSION_PATH=/var/lib/whatsapp/session.db"
+Environment="UPLOAD_DIR=/var/lib/whatsapp/uploads"
+Environment="MAX_FILE_SIZE=10485760"
+Environment="RATE_LIMIT_MIN_DELAY=3000"
+Environment="RATE_LIMIT_MAX_DELAY=5000"
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/whatsapp
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=512
+
+[Install]
+WantedBy=multi-user.target
