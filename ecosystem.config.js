@@ -3,7 +3,7 @@ module.exports = {
     {
       name: 'whatsapp-bulk-backend',
       script: './server',
-      cwd: '/path/to/backend-go', // Update this path
+      cwd: '/home/ubuntu/whatsapp-bulk-server-go', // Update this path
       instances: 1,
       exec_mode: 'fork',
       autorestart: true,
