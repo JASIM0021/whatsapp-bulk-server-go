@@ -63,9 +63,24 @@ func (s *WhatsAppService) Initialize() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.client != nil && s.client.IsConnected() {
-		logger.Info("WhatsApp client already connected")
+	// If already connected and ready, no need to reinitialize
+	if s.client != nil && s.client.IsConnected() && s.isReady {
+		logger.Info("WhatsApp client already connected and ready")
+		// Send ready signal for any waiting listeners
+		select {
+		case s.readyChan <- true:
+		default:
+		}
 		return nil
+	}
+
+	// If we have a client but it's not connected, clean it up first
+	if s.client != nil {
+		logger.Info("Cleaning up existing disconnected client...")
+		s.client.Disconnect()
+		s.client = nil
+		s.isReady = false
+		s.lastQR = ""
 	}
 
 	logger.Info("Initializing WhatsApp client...")
@@ -78,7 +93,8 @@ func (s *WhatsAppService) Initialize() error {
 	}
 
 	// Check if we have a valid session
-	if deviceStore.ID != nil {
+	hasSession := deviceStore.ID != nil
+	if hasSession {
 		logger.Info("Found existing session in database (Device ID: *****%s)", deviceStore.ID.String()[len(deviceStore.ID.String())-8:])
 	} else {
 		logger.Info("No existing session found - will generate QR code for new login")
@@ -91,55 +107,55 @@ func (s *WhatsAppService) Initialize() error {
 	// Register event handlers
 	s.client.AddEventHandler(s.handleEvents)
 
-	// Connect
-	if s.client.Store.ID == nil {
-		logger.Info("No existing session found. Generating QR code...")
+	// Always get QR channel first (in case session is invalid and we need to fallback to QR)
+	qrChan, err := s.client.GetQRChannel(context.Background())
+	if err != nil {
+		logger.Error("Failed to get QR channel: %v", err)
+		return fmt.Errorf("failed to get QR channel: %w", err)
+	}
 
-		// No session exists, need to login
-		qrChan, err := s.client.GetQRChannel(context.Background())
-		if err != nil {
-			logger.Error("Failed to get QR channel: %v", err)
-			return fmt.Errorf("failed to get QR channel: %w", err)
-		}
-
-		err = s.client.Connect()
-		if err != nil {
-			logger.Error("Failed to connect to WhatsApp: %v", err)
-			return fmt.Errorf("failed to connect: %w", err)
-		}
-
-		// Handle QR codes in background
-		go func() {
-			for evt := range qrChan {
-				if evt.Event == "code" {
-					logger.Info("New QR code generated")
-					qrCode, err := s.generateQRDataURL(evt.Code)
-					if err == nil {
-						s.lastQR = qrCode
-						select {
-						case s.qrChan <- qrCode:
-						default:
-						}
+	// Start QR handler in background (will receive QR codes if session is invalid)
+	go func() {
+		for evt := range qrChan {
+			if evt.Event == "code" {
+				logger.Info("New QR code generated")
+				qrCode, err := s.generateQRDataURL(evt.Code)
+				if err == nil {
+					s.lastQR = qrCode
+					select {
+					case s.qrChan <- qrCode:
+					default:
 					}
 				}
 			}
-		}()
+		}
+	}()
+
+	// Connect to WhatsApp
+	err = s.client.Connect()
+	if err != nil {
+		logger.Error("Failed to connect to WhatsApp: %v", err)
+		return fmt.Errorf("failed to connect: %w", err)
+	}
+
+	// If we had an existing session, check if connection succeeded
+	if hasSession {
+		logger.Info("Attempting to connect with existing session...")
+		// Wait a bit to see if connection succeeds
+		time.Sleep(2 * time.Second)
+
+		if s.isReady {
+			logger.Success("Connected successfully with existing session!")
+			select {
+			case s.readyChan <- true:
+			default:
+			}
+		} else {
+			logger.Warn("Existing session failed to connect, waiting for QR code...")
+			// The QR handler above will handle the QR code generation
+		}
 	} else {
-		logger.Success("Existing session found! Connecting...")
-
-		// Session exists, just connect
-		err = s.client.Connect()
-		if err != nil {
-			logger.Error("Failed to connect with existing session: %v", err)
-			return fmt.Errorf("failed to connect: %w", err)
-		}
-		s.isReady = true
-		select {
-		case s.readyChan <- true:
-		default:
-		}
-
-		logger.Success("Connected successfully with existing session!")
+		logger.Info("No existing session - QR code will be generated")
 	}
 
 	return nil
@@ -204,6 +220,12 @@ func (s *WhatsAppService) GetStatus() (bool, bool, bool) {
 	isConnected := s.client != nil && s.client.IsConnected()
 	hasQR := s.lastQR != ""
 	return isConnected, s.isReady, hasQR
+}
+
+func (s *WhatsAppService) GetLastQR() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastQR
 }
 
 func (s *WhatsAppService) IsReady() bool {
@@ -348,10 +370,13 @@ func (s *WhatsAppService) Disconnect() {
 		}
 
 		s.client = nil // Clear client reference
-		s.isReady = false
-		s.lastQR = "" // Clear last QR code
-		logger.Success("WhatsApp client disconnected and logged out")
 	}
+
+	// Always reset state
+	s.isReady = false
+	s.lastQR = "" // Clear last QR code
+
+	logger.Success("WhatsApp client disconnected and logged out")
 
 	// Don't close the container - keep it open for reconnection
 	logger.Info("Database container kept open for future connections")

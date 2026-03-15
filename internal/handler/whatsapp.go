@@ -68,6 +68,34 @@ func (h *WhatsAppHandler) GetQRCode(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, ":\n\n")
 	flusher.Flush()
 
+	// Check current status and send immediately if already ready or has QR
+	isConnected, isReady, hasQR := h.waService.GetStatus()
+
+	if isReady && isConnected {
+		logger.Info("Client already ready, sending ready event immediately")
+		data, _ := json.Marshal(types.ProgressUpdate{
+			Type: "ready",
+			Data: "authenticated",
+		})
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+		return
+	}
+
+	// If there's a QR code already generated, send it immediately
+	if hasQR {
+		lastQR := h.waService.GetLastQR()
+		if lastQR != "" {
+			logger.Info("Sending cached QR code immediately")
+			data, _ := json.Marshal(types.ProgressUpdate{
+				Type: "qr",
+				Data: lastQR,
+			})
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+		}
+	}
+
 	// Listen for events
 	qrChan := h.waService.GetQRChannel()
 	readyChan := h.waService.GetReadyChannel()
@@ -79,6 +107,7 @@ func (h *WhatsAppHandler) GetQRCode(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case qr := <-qrChan:
+			logger.Info("Received new QR code, sending to client")
 			data, _ := json.Marshal(types.ProgressUpdate{
 				Type: "qr",
 				Data: qr,
@@ -87,6 +116,7 @@ func (h *WhatsAppHandler) GetQRCode(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 
 		case <-readyChan:
+			logger.Info("Client ready, sending ready event")
 			data, _ := json.Marshal(types.ProgressUpdate{
 				Type: "ready",
 				Data: "authenticated",
@@ -101,6 +131,7 @@ func (h *WhatsAppHandler) GetQRCode(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 
 		case <-timeout:
+			logger.Warn("QR code request timed out after 2 minutes")
 			data, _ := json.Marshal(types.ProgressUpdate{
 				Type: "error",
 				Data: "QR code timeout",
@@ -110,6 +141,7 @@ func (h *WhatsAppHandler) GetQRCode(w http.ResponseWriter, r *http.Request) {
 			return
 
 		case <-r.Context().Done():
+			logger.Info("Client disconnected from QR stream")
 			return
 		}
 	}
