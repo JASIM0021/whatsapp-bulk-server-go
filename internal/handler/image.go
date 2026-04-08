@@ -95,13 +95,21 @@ func (h *ImageHandler) UploadImage(w http.ResponseWriter, r *http.Request) {
 		respondError(w, "Failed to save image", http.StatusInternalServerError)
 		return
 	}
-	defer dst.Close()
 
 	// Copy uploaded file to destination
 	written, err := io.Copy(dst, file)
 	if err != nil {
+		dst.Close()
 		logger.Error("Failed to save image: %v", err)
 		os.Remove(filepath) // Clean up on error
+		respondError(w, "Failed to save image", http.StatusInternalServerError)
+		return
+	}
+
+	// Explicitly close and flush to disk before returning the path
+	if err := dst.Close(); err != nil {
+		logger.Error("Failed to flush image file: %v", err)
+		os.Remove(filepath)
 		respondError(w, "Failed to save image", http.StatusInternalServerError)
 		return
 	}

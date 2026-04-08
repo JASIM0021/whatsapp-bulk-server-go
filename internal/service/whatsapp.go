@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -19,11 +20,23 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo/options"
 	"google.golang.org/protobuf/proto"
 
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+
+	"github.com/JASIM0021/bulk-whatsapp-send/backend/internal/db"
 	"github.com/JASIM0021/bulk-whatsapp-send/backend/internal/logger"
 )
+
+// waSessionDoc is the MongoDB document that stores a user's WhatsApp session.
+type waSessionDoc struct {
+	UserID      string    `bson:"user_id"`
+	SessionData []byte    `bson:"session_data"` // SQLite file bytes (base64-unencoded binary)
+	WAPhone     string    `bson:"wa_phone"`
+	UpdatedAt   time.Time `bson:"updated_at"`
+}
 
 type WhatsAppService struct {
 	client         *whatsmeow.Client
@@ -34,6 +47,12 @@ type WhatsAppService struct {
 	mu             sync.RWMutex
 	isReady        bool
 	lastQR         string
+
+	// session persistence
+	db      *db.DB
+	userID  string
+	dbPath  string // path to the temp SQLite file
+	stopSync chan struct{}
 }
 
 func NewWhatsAppService() (*WhatsAppService, error) {
@@ -41,32 +60,122 @@ func NewWhatsAppService() (*WhatsAppService, error) {
 	if dbPath == "" {
 		dbPath = "./whatsapp_session.db"
 	}
+	return NewWhatsAppServiceWithPath(dbPath, "", nil)
+}
 
-	// Create database logger
-	dbLog := waLog.Stdout("Database", "INFO", true)
-	container, err := sqlstore.New(context.Background(), "sqlite3", fmt.Sprintf("file:%s?_foreign_keys=on", dbPath), dbLog)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create database: %w", err)
-	}
-
-	service := &WhatsAppService{
-		container:      container,
+func NewWhatsAppServiceWithPath(dbPath, userID string, database *db.DB) (*WhatsAppService, error) {
+	svc := &WhatsAppService{
 		qrChan:         make(chan string, 10),
 		readyChan:      make(chan bool, 10),
 		disconnectChan: make(chan string, 10),
+		stopSync:       make(chan struct{}),
+		db:             database,
+		userID:         userID,
+		dbPath:         dbPath,
 	}
 
-	return service, nil
+	// If MongoDB is available, try to restore the session from it.
+	if database != nil && userID != "" {
+		if err := svc.restoreFromMongo(context.Background()); err != nil {
+			logger.Warn("Could not restore session from MongoDB for user %s: %v", userID, err)
+		}
+	}
+
+	dbLog := waLog.Stdout("Database", "ERROR", true)
+	container, err := sqlstore.New(context.Background(), "sqlite3",
+		fmt.Sprintf("file:%s?_foreign_keys=on", dbPath), dbLog)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create database: %w", err)
+	}
+	svc.container = container
+	return svc, nil
+}
+
+// restoreFromMongo loads the SQLite session bytes from MongoDB and writes them to dbPath.
+func (s *WhatsAppService) restoreFromMongo(ctx context.Context) error {
+	var doc waSessionDoc
+	err := s.db.WASessions().FindOne(ctx, bson.M{"user_id": s.userID}).Decode(&doc)
+	if err != nil {
+		return nil // no session stored yet — not an error
+	}
+	if len(doc.SessionData) == 0 {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(s.dbPath), 0755); err != nil {
+		return err
+	}
+	logger.Info("Restoring WhatsApp session from MongoDB for user %s", s.userID)
+	return os.WriteFile(s.dbPath, doc.SessionData, 0600)
+}
+
+// syncToMongo reads the current SQLite file and saves it to MongoDB.
+func (s *WhatsAppService) syncToMongo(waPhone string) {
+	if s.db == nil || s.userID == "" {
+		return
+	}
+
+	// Checkpoint WAL so the main db file is up-to-date before we read it.
+	sqlDB, err := sql.Open("sqlite3", fmt.Sprintf("file:%s?_foreign_keys=on", s.dbPath))
+	if err == nil {
+		sqlDB.Exec("PRAGMA wal_checkpoint(FULL)") //nolint
+		sqlDB.Close()
+	}
+
+	data, err := os.ReadFile(s.dbPath)
+	if err != nil {
+		logger.Warn("syncToMongo: could not read session file: %v", err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	doc := waSessionDoc{
+		UserID:      s.userID,
+		SessionData: data,
+		WAPhone:     waPhone,
+		UpdatedAt:   time.Now(),
+	}
+	opts := options.Replace().SetUpsert(true)
+	_, err = s.db.WASessions().ReplaceOne(ctx, bson.M{"user_id": s.userID}, doc, opts)
+	if err != nil {
+		logger.Warn("syncToMongo: could not save session to MongoDB: %v", err)
+		return
+	}
+	logger.Info("WhatsApp session synced to MongoDB for user %s", s.userID)
+}
+
+// startPeriodicSync syncs the session to MongoDB every 2 minutes while connected.
+func (s *WhatsAppService) startPeriodicSync() {
+	ticker := time.NewTicker(2 * time.Minute)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s.mu.RLock()
+				waPhone := ""
+				if s.client != nil && s.client.Store.ID != nil {
+					waPhone = s.client.Store.ID.String()
+				}
+				connected := s.client != nil && s.client.IsConnected()
+				s.mu.RUnlock()
+				if connected {
+					s.syncToMongo(waPhone)
+				}
+			case <-s.stopSync:
+				return
+			}
+		}
+	}()
 }
 
 func (s *WhatsAppService) Initialize() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// If already connected and ready, no need to reinitialize
 	if s.client != nil && s.client.IsConnected() && s.isReady {
 		logger.Info("WhatsApp client already connected and ready")
-		// Send ready signal for any waiting listeners
 		select {
 		case s.readyChan <- true:
 		default:
@@ -74,7 +183,6 @@ func (s *WhatsAppService) Initialize() error {
 		return nil
 	}
 
-	// If we have a client but it's not connected, clean it up first
 	if s.client != nil {
 		logger.Info("Cleaning up existing disconnected client...")
 		s.client.Disconnect()
@@ -85,43 +193,39 @@ func (s *WhatsAppService) Initialize() error {
 
 	logger.Info("Initializing WhatsApp client...")
 
-	// Get first device or create new
 	deviceStore, err := s.container.GetFirstDevice(context.Background())
 	if err != nil {
 		logger.Error("Failed to get device from store: %v", err)
 		return fmt.Errorf("failed to get device: %w", err)
 	}
 
-	// Check if we have a valid session
 	hasSession := deviceStore.ID != nil
 	if hasSession {
-		logger.Info("Found existing session in database (Device ID: *****%s)", deviceStore.ID.String()[len(deviceStore.ID.String())-8:])
+		logger.Info("Found existing session (Device ID: *****%s)",
+			deviceStore.ID.String()[max(0, len(deviceStore.ID.String())-8):])
 	} else {
-		logger.Info("No existing session found - will generate QR code for new login")
+		logger.Info("No existing session — will generate QR code for new login")
 	}
 
-	// Create client logger
-	clientLog := waLog.Stdout("WhatsApp", "INFO", true)
+	clientLog := waLog.Stdout("WhatsApp", "ERROR", true)
 	s.client = whatsmeow.NewClient(deviceStore, clientLog)
-
-	// Register event handlers
 	s.client.AddEventHandler(s.handleEvents)
 
-	// Always get QR channel first (in case session is invalid and we need to fallback to QR)
 	qrChan, err := s.client.GetQRChannel(context.Background())
 	if err != nil {
 		logger.Error("Failed to get QR channel: %v", err)
 		return fmt.Errorf("failed to get QR channel: %w", err)
 	}
 
-	// Start QR handler in background (will receive QR codes if session is invalid)
 	go func() {
 		for evt := range qrChan {
 			if evt.Event == "code" {
 				logger.Info("New QR code generated")
 				qrCode, err := s.generateQRDataURL(evt.Code)
 				if err == nil {
+					s.mu.Lock()
 					s.lastQR = qrCode
+					s.mu.Unlock()
 					select {
 					case s.qrChan <- qrCode:
 					default:
@@ -131,62 +235,77 @@ func (s *WhatsAppService) Initialize() error {
 		}
 	}()
 
-	// Connect to WhatsApp
-	err = s.client.Connect()
-	if err != nil {
+	if err := s.client.Connect(); err != nil {
 		logger.Error("Failed to connect to WhatsApp: %v", err)
 		return fmt.Errorf("failed to connect: %w", err)
 	}
 
-	// If we had an existing session, check if connection succeeded
 	if hasSession {
-		logger.Info("Attempting to connect with existing session...")
-		// Wait a bit to see if connection succeeds
-		time.Sleep(2 * time.Second)
-
+		logger.Info("Attempting to reconnect with existing session...")
+		time.Sleep(3 * time.Second)
 		if s.isReady {
-			logger.Success("Connected successfully with existing session!")
+			logger.Success("Reconnected with existing session!")
 			select {
 			case s.readyChan <- true:
 			default:
 			}
 		} else {
-			logger.Warn("Existing session failed to connect, waiting for QR code...")
-			// The QR handler above will handle the QR code generation
+			logger.Warn("Existing session could not reconnect — waiting for QR code...")
 		}
 	} else {
-		logger.Info("No existing session - QR code will be generated")
+		logger.Info("No existing session — QR code will be generated shortly")
 	}
 
 	return nil
 }
 
 func (s *WhatsAppService) handleEvents(evt interface{}) {
-	switch evt.(type) {
+	switch v := evt.(type) {
 	case *events.LoggedOut:
 		s.mu.Lock()
 		s.isReady = false
 		s.mu.Unlock()
+		logger.Warn("WhatsApp logged out (reason: %v)", v.Reason)
 		select {
 		case s.disconnectChan <- "logged out":
 		default:
 		}
+
 	case *events.Connected:
 		if s.client.Store.ID != nil {
 			s.mu.Lock()
 			s.isReady = true
+			waPhone := s.client.Store.ID.String()
 			s.mu.Unlock()
+
+			logger.Success("WhatsApp connected! Phone: %s", waPhone)
+
 			select {
 			case s.readyChan <- true:
 			default:
 			}
+
+			// Persist session to MongoDB and start periodic sync
+			go s.syncToMongo(waPhone)
+			go s.startPeriodicSync()
 		}
+
+	case *events.Disconnected:
+		s.mu.Lock()
+		s.isReady = false
+		s.mu.Unlock()
+		logger.Warn("WhatsApp disconnected")
+		select {
+		case s.disconnectChan <- "disconnected":
+		default:
+		}
+
 	case *events.StreamReplaced:
 		s.mu.Lock()
 		s.isReady = false
 		s.mu.Unlock()
 		select {
-		case s.disconnectChan <- "disconnected":
+		case s.disconnectChan <- "stream replaced":
 		default:
 		}
 	}
@@ -201,25 +320,17 @@ func (s *WhatsAppService) generateQRDataURL(code string) (string, error) {
 	return fmt.Sprintf("data:image/png;base64,%s", encoded), nil
 }
 
-func (s *WhatsAppService) GetQRChannel() <-chan string {
-	return s.qrChan
-}
+func (s *WhatsAppService) GetQRChannel() <-chan string  { return s.qrChan }
+func (s *WhatsAppService) GetReadyChannel() <-chan bool { return s.readyChan }
+func (s *WhatsAppService) GetDisconnectChannel() <-chan string { return s.disconnectChan }
 
-func (s *WhatsAppService) GetReadyChannel() <-chan bool {
-	return s.readyChan
-}
-
-func (s *WhatsAppService) GetDisconnectChannel() <-chan string {
-	return s.disconnectChan
-}
-
-func (s *WhatsAppService) GetStatus() (bool, bool, bool) {
+func (s *WhatsAppService) GetStatus() (isConnected, isReady, hasQR bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
-	isConnected := s.client != nil && s.client.IsConnected()
-	hasQR := s.lastQR != ""
-	return isConnected, s.isReady, hasQR
+	isConnected = s.client != nil && s.client.IsConnected()
+	isReady = s.isReady && isConnected // isReady requires a live connection
+	hasQR = s.lastQR != ""
+	return
 }
 
 func (s *WhatsAppService) GetLastQR() string {
@@ -231,7 +342,7 @@ func (s *WhatsAppService) GetLastQR() string {
 func (s *WhatsAppService) IsReady() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.isReady
+	return s.isReady && s.client != nil && s.client.IsConnected()
 }
 
 func (s *WhatsAppService) SendMessage(phone, message string) error {
@@ -240,216 +351,175 @@ func (s *WhatsAppService) SendMessage(phone, message string) error {
 	ready := s.isReady
 	s.mu.RUnlock()
 
-	if !ready || client == nil {
-		logger.Error("WhatsApp client not ready - isReady: %v, client nil: %v", ready, client == nil)
-		return fmt.Errorf("WhatsApp client not ready")
+	// Guard: require both isReady flag AND a live WebSocket connection.
+	if !ready || client == nil || !client.IsConnected() {
+		logger.Error("WhatsApp not ready — isReady: %v, connected: %v",
+			ready, client != nil && client.IsConnected())
+		return fmt.Errorf("WhatsApp client not ready or disconnected")
 	}
 
-	// Parse and normalize phone number
 	jid, normalizedPhone, err := s.parseAndNormalizePhone(phone)
 	if err != nil {
 		logger.Error("Invalid phone number '%s': %v", phone, err)
 		return fmt.Errorf("invalid phone number: %w", err)
 	}
 
-	logger.Debug("Parsed phone: %s -> JID: %s", phone, jid.String())
+	logger.Info("Checking if %s is on WhatsApp...", normalizedPhone)
 
-	// CRITICAL: Check if the number is registered on WhatsApp
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	isOnWhatsAppResult, err := client.IsOnWhatsApp(ctx, []string{normalizedPhone})
 	if err != nil {
-		logger.Warn("IsOnWhatsApp check failed for %s: %v (will attempt to send anyway)", normalizedPhone, err)
+		logger.Warn("IsOnWhatsApp check failed for %s: %v (attempting send anyway)", normalizedPhone, err)
 	} else if len(isOnWhatsAppResult) > 0 {
 		if !isOnWhatsAppResult[0].IsIn {
-			logger.WhatsAppNotRegistered(phone)
+			logger.Info("Number %s is NOT registered on WhatsApp", phone)
 			return fmt.Errorf("number %s is not registered on WhatsApp", phone)
 		}
-		// IMPORTANT: Use the JID returned by WhatsApp (this is the correct, verified JID)
 		jid = isOnWhatsAppResult[0].JID
-		logger.WhatsAppVerified(phone, jid.String())
+		logger.Info("Verified %s on WhatsApp → JID: %s", phone, jid.String())
 	}
 
-	// Prepare message preview for logging
-	msgPreview := message
-	if len(msgPreview) > 100 {
-		msgPreview = msgPreview[:100] + "..."
-	}
-	logger.Debug("Sending message to %s: \"%s\"", jid.String(), msgPreview)
-
-	// Send message with timeout
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel2()
 
-	// Use Conversation field for better compatibility
 	resp, err := client.SendMessage(ctx2, jid, &waProto.Message{
 		Conversation: proto.String(message),
 	})
-
 	if err != nil {
-		logger.Error("Failed to send message to %s (JID: %s): %v", phone, jid.String(), err)
+		logger.Error("SendMessage failed for %s: %v", phone, err)
 		return fmt.Errorf("failed to send message: %w", err)
 	}
-
-	// Verify the response
 	if resp.ID == "" {
-		logger.Error("Message sent but no message ID returned for %s", phone)
-		return fmt.Errorf("message sent but no confirmation received")
+		return fmt.Errorf("message sent but no confirmation received from server")
 	}
 
-	logger.Debug("Message sent successfully! ID: %s, Timestamp: %v, ServerID: %d", resp.ID, resp.Timestamp, resp.ServerID)
+	logger.Info("Message delivered — ID: %s, Timestamp: %v", resp.ID, resp.Timestamp)
 	return nil
 }
 
 func (s *WhatsAppService) parseAndNormalizePhone(phone string) (types.JID, string, error) {
-	// Remove all non-digit characters except '+'
 	cleanPhone := ""
 	for _, char := range phone {
 		if char >= '0' && char <= '9' {
 			cleanPhone += string(char)
 		}
 	}
-
 	if cleanPhone == "" {
 		return types.JID{}, "", fmt.Errorf("invalid phone number: no digits found")
 	}
-
-	// Ensure phone starts with country code
-	// If it doesn't start with a valid international prefix, it might need one
 	if len(cleanPhone) < 10 {
 		return types.JID{}, "", fmt.Errorf("phone number too short: %s", cleanPhone)
 	}
-
-	// Remove leading zeros (common issue)
 	cleanPhone = strings.TrimLeft(cleanPhone, "0")
-
-	// Create normalized phone with + prefix for WhatsApp check
 	normalizedPhone := "+" + cleanPhone
-
-	// Create JID (without + symbol)
 	jid := types.JID{
 		User:   cleanPhone,
 		Server: types.DefaultUserServer,
 	}
-
-	logger.Debug("Phone normalization: '%s' -> clean: '%s' -> normalized: '%s' -> JID: %s",
-		phone, cleanPhone, normalizedPhone, jid.String())
-
 	return jid, normalizedPhone, nil
 }
 
 func (s *WhatsAppService) Disconnect() {
+	// Stop periodic sync
+	select {
+	case s.stopSync <- struct{}{}:
+	default:
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	logger.Info("Disconnecting WhatsApp client...")
 
 	if s.client != nil {
-		// Get device store before logout
-		deviceStore := s.client.Store
-
-		// Logout from WhatsApp (this tells WhatsApp servers to disconnect)
-		err := s.client.Logout(context.Background())
-		if err != nil {
-			logger.Warn("Logout error (non-critical): %v", err)
+		waPhone := ""
+		if s.client.Store.ID != nil {
+			waPhone = s.client.Store.ID.String()
 		}
 
-		// Disconnect the client
+		deviceStore := s.client.Store
+
+		if err := s.client.Logout(context.Background()); err != nil {
+			logger.Warn("Logout error (non-critical): %v", err)
+		}
 		s.client.Disconnect()
 
-		// Delete the device/session from database to force new QR code on next login
 		if deviceStore != nil && deviceStore.ID != nil {
-			logger.Info("Deleting session from database to force new QR code...")
-			err = deviceStore.Delete(context.Background())
-			if err != nil {
-				logger.Warn("Failed to delete session from database: %v", err)
-			} else {
-				logger.Success("Session deleted from database - next login will require new QR code")
+			if err := deviceStore.Delete(context.Background()); err != nil {
+				logger.Warn("Failed to delete session from SQLite: %v", err)
 			}
 		}
 
-		s.client = nil // Clear client reference
+		// Remove session from MongoDB on explicit disconnect/logout
+		if s.db != nil && s.userID != "" {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			s.db.WASessions().DeleteOne(ctx, bson.M{"user_id": s.userID}) //nolint
+			logger.Info("WhatsApp session removed from MongoDB for user %s", s.userID)
+		}
+
+		_ = waPhone
+		s.client = nil
 	}
 
-	// Always reset state
 	s.isReady = false
-	s.lastQR = "" // Clear last QR code
-
-	logger.Success("WhatsApp client disconnected and logged out")
-
-	// Don't close the container - keep it open for reconnection
-	logger.Info("Database container kept open for future connections")
+	s.lastQR = ""
+	logger.Success("WhatsApp disconnected")
 }
 
-// SendWithDelay sends a message with rate limiting
 func (s *WhatsAppService) SendWithDelay(phone, message string, delay time.Duration) error {
 	time.Sleep(delay)
 	return s.SendMessage(phone, message)
 }
 
-// SendMessageWithImage sends a message with an image
 func (s *WhatsAppService) SendMessageWithImage(phone, message, imagePath string) error {
 	s.mu.RLock()
 	client := s.client
 	ready := s.isReady
 	s.mu.RUnlock()
 
-	if !ready || client == nil {
-		logger.Error("WhatsApp client not ready - isReady: %v, client nil: %v", ready, client == nil)
-		return fmt.Errorf("WhatsApp client not ready")
+	if !ready || client == nil || !client.IsConnected() {
+		return fmt.Errorf("WhatsApp client not ready or disconnected")
 	}
 
-	// Parse and normalize phone number
 	jid, normalizedPhone, err := s.parseAndNormalizePhone(phone)
 	if err != nil {
-		logger.Error("Invalid phone number '%s': %v", phone, err)
 		return fmt.Errorf("invalid phone number: %w", err)
 	}
 
-	logger.Debug("Parsed phone: %s -> JID: %s", phone, jid.String())
-
-	// Check if the number is registered on WhatsApp
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	isOnWhatsAppResult, err := client.IsOnWhatsApp(ctx, []string{normalizedPhone})
 	if err != nil {
-		logger.Warn("IsOnWhatsApp check failed for %s: %v (will attempt to send anyway)", normalizedPhone, err)
+		logger.Warn("IsOnWhatsApp check failed for %s: %v", normalizedPhone, err)
 	} else if len(isOnWhatsAppResult) > 0 {
 		if !isOnWhatsAppResult[0].IsIn {
-			logger.WhatsAppNotRegistered(phone)
 			return fmt.Errorf("number %s is not registered on WhatsApp", phone)
 		}
 		jid = isOnWhatsAppResult[0].JID
-		logger.WhatsAppVerified(phone, jid.String())
 	}
 
-	// Read image file
 	imageData, err := os.ReadFile(imagePath)
 	if err != nil {
-		logger.Error("Failed to read image file '%s': %v", imagePath, err)
 		return fmt.Errorf("failed to read image: %w", err)
 	}
 
-	// Detect MIME type
-	mimeType := http.DetectContentType(imageData)
-	logger.Debug("Detected image MIME type: %s", mimeType)
+	mimeType := detectImageMimeType(imageData, imagePath)
+	logger.Info("Image loaded: %s (size: %d bytes, mime: %s)", imagePath, len(imageData), mimeType)
 
-	// Upload image to WhatsApp servers
-	logger.Info("Uploading image to WhatsApp servers... (size: %d bytes)", len(imageData))
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel2()
 
 	uploaded, err := client.Upload(ctx2, imageData, whatsmeow.MediaImage)
 	if err != nil {
-		logger.Error("Failed to upload image to WhatsApp: %v", err)
+		logger.Error("Failed to upload image to WhatsApp servers: %v", err)
 		return fmt.Errorf("failed to upload image: %w", err)
 	}
+	logger.Info("Image uploaded to WhatsApp servers successfully (URL: %s)", uploaded.URL)
 
-	logger.Success("Image uploaded successfully! URL: %s", uploaded.URL)
-
-	// Prepare image message
 	imageMsg := &waProto.ImageMessage{
 		URL:           proto.String(uploaded.URL),
 		DirectPath:    proto.String(uploaded.DirectPath),
@@ -459,37 +529,26 @@ func (s *WhatsAppService) SendMessageWithImage(phone, message, imagePath string)
 		FileSHA256:    uploaded.FileSHA256,
 		FileLength:    proto.Uint64(uint64(len(imageData))),
 	}
-
-	// Add caption if message is provided
 	if message != "" {
 		imageMsg.Caption = proto.String(message)
 	}
 
-	// Send message
 	ctx3, cancel3 := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel3()
 
-	resp, err := client.SendMessage(ctx3, jid, &waProto.Message{
-		ImageMessage: imageMsg,
-	})
-
+	resp, err := client.SendMessage(ctx3, jid, &waProto.Message{ImageMessage: imageMsg})
 	if err != nil {
-		logger.Error("Failed to send image message to %s (JID: %s): %v", phone, jid.String(), err)
+		logger.Error("Failed to send image message to %s: %v", phone, err)
 		return fmt.Errorf("failed to send image message: %w", err)
 	}
-
 	if resp.ID == "" {
-		logger.Error("Image message sent but no message ID returned for %s", phone)
 		return fmt.Errorf("message sent but no confirmation received")
 	}
-
-	logger.Debug("Image message sent successfully! ID: %s, Timestamp: %v", resp.ID, resp.Timestamp)
+	logger.Info("Image message delivered — ID: %s, Timestamp: %v", resp.ID, resp.Timestamp)
 	return nil
 }
 
-// SendMessageWithImageURL sends a message with an image from URL
 func (s *WhatsAppService) SendMessageWithImageURL(phone, message, imageURL string) error {
-	// Download image from URL
 	logger.Info("Downloading image from URL: %s", imageURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -502,7 +561,6 @@ func (s *WhatsAppService) SendMessageWithImageURL(phone, message, imageURL strin
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		logger.Error("Failed to download image from %s: %v", imageURL, err)
 		return fmt.Errorf("failed to download image: %w", err)
 	}
 	defer resp.Body.Close()
@@ -511,22 +569,48 @@ func (s *WhatsAppService) SendMessageWithImageURL(phone, message, imageURL strin
 		return fmt.Errorf("failed to download image: HTTP %d", resp.StatusCode)
 	}
 
-	// Save to temporary file
-	tempFile := filepath.Join(os.TempDir(), fmt.Sprintf("whatsapp_img_%d%s", time.Now().Unix(), filepath.Ext(imageURL)))
+	tempFile := filepath.Join(os.TempDir(),
+		fmt.Sprintf("whatsapp_img_%d%s", time.Now().Unix(), filepath.Ext(imageURL)))
 	file, err := os.Create(tempFile)
 	if err != nil {
 		return fmt.Errorf("failed to create temp file: %w", err)
 	}
-	defer file.Close()
-	defer os.Remove(tempFile) // Clean up after sending
+	defer os.Remove(tempFile)
 
-	_, err = io.Copy(file, resp.Body)
-	if err != nil {
+	if _, err = io.Copy(file, resp.Body); err != nil {
+		file.Close()
 		return fmt.Errorf("failed to save image: %w", err)
 	}
-
-	logger.Success("Image downloaded to: %s", tempFile)
-
-	// Send using the image file
+	// Must close the file before reading it in SendMessageWithImage
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("failed to flush temp image file: %w", err)
+	}
 	return s.SendMessageWithImage(phone, message, tempFile)
+}
+
+// detectImageMimeType detects the MIME type of image data using magic bytes.
+// Go's http.DetectContentType does not recognize WebP, so we check manually.
+func detectImageMimeType(data []byte, filePath string) string {
+	if len(data) >= 12 {
+		// WebP: starts with "RIFF" + 4 bytes size + "WEBP"
+		if string(data[0:4]) == "RIFF" && string(data[8:12]) == "WEBP" {
+			return "image/webp"
+		}
+	}
+	// Fall back to Go's built-in detection
+	mime := http.DetectContentType(data)
+	// If detection failed, try to infer from file extension
+	if mime == "application/octet-stream" {
+		switch strings.ToLower(filepath.Ext(filePath)) {
+		case ".webp":
+			return "image/webp"
+		case ".jpg", ".jpeg":
+			return "image/jpeg"
+		case ".png":
+			return "image/png"
+		case ".gif":
+			return "image/gif"
+		}
+	}
+	return mime
 }

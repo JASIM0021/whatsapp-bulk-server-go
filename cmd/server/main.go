@@ -9,15 +9,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/JASIM0021/bulk-whatsapp-send/backend/internal/db"
 	"github.com/JASIM0021/bulk-whatsapp-send/backend/internal/handler"
 	"github.com/JASIM0021/bulk-whatsapp-send/backend/internal/logger"
 	"github.com/JASIM0021/bulk-whatsapp-send/backend/internal/middleware"
 	"github.com/JASIM0021/bulk-whatsapp-send/backend/internal/service"
+	"github.com/JASIM0021/bulk-whatsapp-send/backend/internal/types"
 	"github.com/joho/godotenv"
 )
 
 func main() {
-	// Print startup banner
 	logger.Section("WHATSAPP BULK SENDER - GO BACKEND")
 	logger.Info("Starting server initialization...")
 
@@ -28,52 +29,113 @@ func main() {
 		logger.Success("Loaded configuration from .env file")
 	}
 
-	// Initialize WhatsApp service
-	logger.Info("Initializing WhatsApp service...")
-	waService, err := service.NewWhatsAppService()
+	// Initialize app database
+	logger.Info("Connecting to MongoDB...")
+	mongoURI := os.Getenv("MONGODB_URI")
+	if mongoURI == "" {
+		mongoURI = os.Getenv("MONGODB_URL")
+	}
+	if mongoURI == "" {
+		mongoURI = "mongodb://localhost:27017"
+	}
+	appDB, err := db.New(mongoURI)
 	if err != nil {
-		logger.Error("Failed to initialize WhatsApp service: %v", err)
+		logger.Error("Failed to connect to MongoDB: %v", err)
 		os.Exit(1)
 	}
-	logger.Success("WhatsApp service initialized successfully")
+	if err := appDB.EnsureIndexes(context.Background()); err != nil {
+		logger.Error("Failed to ensure indexes: %v", err)
+		os.Exit(1)
+	}
+	logger.Success("MongoDB connected and ready")
 
-	// Create HTTP server
-	mux := http.NewServeMux()
+	// Initialize services first (needed for seeding)
+	authService := service.NewAuthService(appDB)
+	templateService := service.NewTemplateService(appDB)
+
+	// Seed default user if not exists
+	logger.Info("Checking for default user...")
+	seedUser := types.RegisterRequest{
+		Email:    "user1@gmail.com",
+		Password: "123456",
+		Name:     "Test User",
+	}
+	userResp, err := authService.Register(context.Background(), seedUser)
+	if err != nil {
+		logger.Info("Default user already exists")
+	} else {
+		logger.Success("Created default user: user1@gmail.com / 123456")
+	}
+
+	// Seed default templates
+	logger.Info("Seeding default templates...")
+	defaultTemplates := []types.CreateTemplateRequest{
+		{Name: "Welcome Message", Category: "Marketing", Body: "Hello {{name}}! Welcome to our service. We're glad to have you!", Variables: []string{"name"}},
+		{Name: "Order Confirmation", Category: "Utility", Body: "Hi {{name}}, your order #{{order_id}} has been confirmed. Expected delivery: {{delivery_date}}", Variables: []string{"name", "order_id", "delivery_date"}},
+		{Name: "Payment Reminder", Category: "Utility", Body: "Hello {{name}}, this is a reminder that your payment of {{amount}} is due on {{due_date}}", Variables: []string{"name", "amount", "due_date"}},
+		{Name: "OTP Verification", Category: "Authentication", Body: "Your verification code is: {{otp}}. Valid for {{validity}} minutes.", Variables: []string{"name", "otp", "validity"}},
+		{Name: "Promotional Offer", Category: "Marketing", Body: "Hi {{name}}! 🎉 Get {{discount}}% off on your next purchase. Use code: {{code}}", Variables: []string{"name", "discount", "code"}},
+	}
+	for _, tmpl := range defaultTemplates {
+		if userResp != nil {
+			templateService.Create(context.Background(), userResp.User.ID, tmpl)
+		}
+	}
+	logger.Success("Default templates created")
 
 	// Initialize handlers
-	whatsappHandler := handler.NewWhatsAppHandler(waService)
+	authHandler := handler.NewAuthHandler(authService)
+	templateHandler := handler.NewTemplateHandler(templateService)
+	whatsappHandler := handler.NewWhatsAppHandler("sessions", appDB)
 	uploadHandler := handler.NewUploadHandler()
 	imageHandler := handler.NewImageHandler()
 
-	// Health check
+	// Auth middleware helper
+	authMiddleware := middleware.Auth(authService)
+	wrap := func(h http.HandlerFunc) http.Handler {
+		return authMiddleware(http.HandlerFunc(h))
+	}
+
+	// Create HTTP mux
+	mux := http.NewServeMux()
+
+	// Public routes
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"success":true,"message":"Server is running"}`))
 	})
+	mux.HandleFunc("/api/auth/register", authHandler.Register)
+	mux.HandleFunc("/api/auth/login", authHandler.Login)
 
-	// WhatsApp routes
-	mux.HandleFunc("/api/whatsapp/init", whatsappHandler.Initialize)
-	mux.HandleFunc("/api/whatsapp/qr", whatsappHandler.GetQRCode)
-	mux.HandleFunc("/api/whatsapp/status", whatsappHandler.GetStatus)
-	mux.HandleFunc("/api/whatsapp/disconnect", whatsappHandler.Disconnect)
-	mux.HandleFunc("/api/whatsapp/send", whatsappHandler.SendMessages)
-
-	// Upload routes
-	mux.HandleFunc("/api/upload", uploadHandler.UploadFile)
-	mux.HandleFunc("/api/upload/image", imageHandler.UploadImage)
+	// Protected routes
+	mux.Handle("/api/auth/me", wrap(authHandler.Me))
+	mux.Handle("/api/whatsapp/init", wrap(whatsappHandler.Initialize))
+	mux.Handle("/api/whatsapp/qr", wrap(whatsappHandler.GetQRCode))
+	mux.Handle("/api/whatsapp/status", wrap(whatsappHandler.GetStatus))
+	mux.Handle("/api/whatsapp/disconnect", wrap(whatsappHandler.Disconnect))
+	mux.Handle("/api/whatsapp/send", wrap(whatsappHandler.SendMessages))
+	mux.Handle("/api/upload", wrap(uploadHandler.UploadFile))
+	mux.Handle("/api/upload/image", wrap(imageHandler.UploadImage))
+	mux.Handle("/api/templates", wrap(templateHandler.HandleCollection))
+	mux.Handle("/api/templates/", wrap(templateHandler.Single))
 
 	logger.Info("Registered API routes:")
 	logger.Info("  • GET  /api/health")
-	logger.Info("  • POST /api/whatsapp/init")
-	logger.Info("  • GET  /api/whatsapp/qr")
-	logger.Info("  • GET  /api/whatsapp/status")
-	logger.Info("  • POST /api/whatsapp/disconnect")
-	logger.Info("  • POST /api/whatsapp/send")
-	logger.Info("  • POST /api/upload")
-	logger.Info("  • POST /api/upload/image")
+	logger.Info("  • POST /api/auth/register")
+	logger.Info("  • POST /api/auth/login")
+	logger.Info("  • GET  /api/auth/me  [protected]")
+	logger.Info("  • POST /api/whatsapp/init  [protected]")
+	logger.Info("  • GET  /api/whatsapp/qr  [protected]")
+	logger.Info("  • GET  /api/whatsapp/status  [protected]")
+	logger.Info("  • POST /api/whatsapp/disconnect  [protected]")
+	logger.Info("  • POST /api/whatsapp/send  [protected]")
+	logger.Info("  • POST /api/upload  [protected]")
+	logger.Info("  • POST /api/upload/image  [protected]")
+	logger.Info("  • GET/POST /api/templates  [protected]")
+	logger.Info("  • PUT/DELETE /api/templates/{id}  [protected]")
 
-	// Apply middleware (CORS + Logging)
+	// Apply CORS + Logging middleware
 	handlerWithMiddleware := middleware.Logging(middleware.CORS(mux))
 
 	// Server configuration
@@ -90,7 +152,6 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	// Start server in goroutine
 	go func() {
 		logger.Section("SERVER STARTED")
 		logger.Success("🚀 Server listening on http://localhost:%s", port)
@@ -115,13 +176,11 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Disconnect WhatsApp
-	logger.Info("Disconnecting WhatsApp client...")
-	waService.Disconnect()
-	logger.Success("WhatsApp client disconnected")
+	// Disconnect all WhatsApp sessions
+	logger.Info("Disconnecting all WhatsApp sessions...")
+	whatsappHandler.Shutdown()
+	logger.Success("All WhatsApp sessions disconnected")
 
-	// Shutdown HTTP server
-	logger.Info("Stopping HTTP server...")
 	if err := server.Shutdown(ctx); err != nil {
 		logger.Error("Server forced to shutdown: %v", err)
 		os.Exit(1)

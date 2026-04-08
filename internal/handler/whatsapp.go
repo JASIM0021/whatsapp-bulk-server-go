@@ -6,22 +6,66 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
+	appdb "github.com/JASIM0021/bulk-whatsapp-send/backend/internal/db"
 	"github.com/JASIM0021/bulk-whatsapp-send/backend/internal/logger"
+	"github.com/JASIM0021/bulk-whatsapp-send/backend/internal/middleware"
 	"github.com/JASIM0021/bulk-whatsapp-send/backend/internal/service"
 	"github.com/JASIM0021/bulk-whatsapp-send/backend/internal/types"
 )
 
 type WhatsAppHandler struct {
-	waService *service.WhatsAppService
+	mu       sync.RWMutex
+	services map[string]*service.WhatsAppService
+	dbDir    string
+	db       *appdb.DB
 }
 
-func NewWhatsAppHandler(waService *service.WhatsAppService) *WhatsAppHandler {
+func NewWhatsAppHandler(dbDir string, database *appdb.DB) *WhatsAppHandler {
+	absDir, _ := filepath.Abs(dbDir)
+	os.MkdirAll(absDir, 0755)
 	return &WhatsAppHandler{
-		waService: waService,
+		services: make(map[string]*service.WhatsAppService),
+		dbDir:    absDir,
+		db:       database,
 	}
+}
+
+// Shutdown disconnects all active WhatsApp sessions.
+func (h *WhatsAppHandler) Shutdown() {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, svc := range h.services {
+		svc.Disconnect()
+	}
+}
+
+func (h *WhatsAppHandler) getOrCreateService(userID string) (*service.WhatsAppService, error) {
+	h.mu.RLock()
+	svc, ok := h.services[userID]
+	h.mu.RUnlock()
+	if ok {
+		return svc, nil
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	// Double-check after acquiring write lock
+	if svc, ok := h.services[userID]; ok {
+		return svc, nil
+	}
+
+	dbPath := fmt.Sprintf("%s/whatsapp_session_%s.db", h.dbDir, userID)
+	svc, err := service.NewWhatsAppServiceWithPath(dbPath, userID, h.db)
+	if err != nil {
+		return nil, err
+	}
+	h.services[userID] = svc
+	return svc, nil
 }
 
 func (h *WhatsAppHandler) Initialize(w http.ResponseWriter, r *http.Request) {
@@ -30,16 +74,27 @@ func (h *WhatsAppHandler) Initialize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	logger.Info("Received initialization request")
+	userID, ok := middleware.GetUserID(r)
+	if !ok {
+		respondError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
 
-	err := h.waService.Initialize()
+	waService, err := h.getOrCreateService(userID)
 	if err != nil {
+		respondError(w, fmt.Sprintf("Failed to initialize: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	logger.Info("Received initialization request for user %s", userID)
+
+	if err := waService.Initialize(); err != nil {
 		logger.Error("Failed to initialize WhatsApp client: %v", err)
 		respondError(w, fmt.Sprintf("Failed to initialize: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	logger.Success("WhatsApp client initialized successfully")
+	logger.Success("WhatsApp client initialized for user %s", userID)
 	respondJSON(w, types.APIResponse{
 		Success: true,
 		Message: "WhatsApp client initialized successfully",
@@ -50,6 +105,28 @@ func (h *WhatsAppHandler) GetQRCode(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		respondError(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
+	}
+
+	userID, ok := middleware.GetUserID(r)
+	if !ok {
+		respondError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	waService, err := h.getOrCreateService(userID)
+	if err != nil {
+		respondError(w, fmt.Sprintf("Failed to get session: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Auto-initialize if the client is not yet running
+	isConnected, isReady, _ := waService.GetStatus()
+	if !isConnected && !isReady {
+		logger.Info("Auto-initializing WhatsApp client for QR stream (user %s)", userID)
+		if err := waService.Initialize(); err != nil {
+			respondError(w, fmt.Sprintf("Failed to initialize WhatsApp: %v", err), http.StatusInternalServerError)
+			return
+		}
 	}
 
 	// Set headers for SSE
@@ -69,79 +146,59 @@ func (h *WhatsAppHandler) GetQRCode(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 
 	// Check current status and send immediately if already ready or has QR
-	isConnected, isReady, hasQR := h.waService.GetStatus()
+	isConnected, isReady, hasQR := waService.GetStatus()
 
 	if isReady && isConnected {
-		logger.Info("Client already ready, sending ready event immediately")
-		data, _ := json.Marshal(types.ProgressUpdate{
-			Type: "ready",
-			Data: "authenticated",
-		})
+		logger.Info("Client already ready for user %s, sending ready event immediately", userID)
+		data, _ := json.Marshal(types.ProgressUpdate{Type: "ready", Data: "authenticated"})
 		fmt.Fprintf(w, "data: %s\n\n", data)
 		flusher.Flush()
 		return
 	}
 
-	// If there's a QR code already generated, send it immediately
 	if hasQR {
-		lastQR := h.waService.GetLastQR()
-		if lastQR != "" {
-			logger.Info("Sending cached QR code immediately")
-			data, _ := json.Marshal(types.ProgressUpdate{
-				Type: "qr",
-				Data: lastQR,
-			})
+		if lastQR := waService.GetLastQR(); lastQR != "" {
+			logger.Info("Sending cached QR code for user %s", userID)
+			data, _ := json.Marshal(types.ProgressUpdate{Type: "qr", Data: lastQR})
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
 		}
 	}
 
-	// Listen for events
-	qrChan := h.waService.GetQRChannel()
-	readyChan := h.waService.GetReadyChannel()
+	qrChan := waService.GetQRChannel()
+	readyChan := waService.GetReadyChannel()
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
-
 	timeout := time.After(2 * time.Minute)
 
 	for {
 		select {
 		case qr := <-qrChan:
-			logger.Info("Received new QR code, sending to client")
-			data, _ := json.Marshal(types.ProgressUpdate{
-				Type: "qr",
-				Data: qr,
-			})
+			logger.Info("Received new QR code for user %s", userID)
+			data, _ := json.Marshal(types.ProgressUpdate{Type: "qr", Data: qr})
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
 
 		case <-readyChan:
-			logger.Info("Client ready, sending ready event")
-			data, _ := json.Marshal(types.ProgressUpdate{
-				Type: "ready",
-				Data: "authenticated",
-			})
+			logger.Info("Client ready for user %s", userID)
+			data, _ := json.Marshal(types.ProgressUpdate{Type: "ready", Data: "authenticated"})
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
 			return
 
 		case <-ticker.C:
-			// Keep-alive ping
 			fmt.Fprintf(w, ":\n\n")
 			flusher.Flush()
 
 		case <-timeout:
-			logger.Warn("QR code request timed out after 2 minutes")
-			data, _ := json.Marshal(types.ProgressUpdate{
-				Type: "error",
-				Data: "QR code timeout",
-			})
+			logger.Warn("QR code request timed out for user %s", userID)
+			data, _ := json.Marshal(types.ProgressUpdate{Type: "error", Data: "QR code timeout"})
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
 			return
 
 		case <-r.Context().Done():
-			logger.Info("Client disconnected from QR stream")
+			logger.Info("Client disconnected from QR stream (user %s)", userID)
 			return
 		}
 	}
@@ -153,8 +210,19 @@ func (h *WhatsAppHandler) GetStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	isConnected, isReady, hasQR := h.waService.GetStatus()
+	userID, ok := middleware.GetUserID(r)
+	if !ok {
+		respondError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
 
+	waService, err := h.getOrCreateService(userID)
+	if err != nil {
+		respondError(w, fmt.Sprintf("Failed to get session: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	isConnected, isReady, hasQR := waService.GetStatus()
 	respondJSON(w, types.APIResponse{
 		Success: true,
 		Data: types.WhatsAppStatus{
@@ -172,9 +240,23 @@ func (h *WhatsAppHandler) Disconnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	logger.Info("Received disconnect request")
-	h.waService.Disconnect()
-	logger.Success("WhatsApp disconnected successfully")
+	userID, ok := middleware.GetUserID(r)
+	if !ok {
+		respondError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	h.mu.RLock()
+	waService, exists := h.services[userID]
+	h.mu.RUnlock()
+
+	if exists {
+		waService.Disconnect()
+		h.mu.Lock()
+		delete(h.services, userID)
+		h.mu.Unlock()
+		logger.Success("WhatsApp disconnected for user %s", userID)
+	}
 
 	respondJSON(w, types.APIResponse{
 		Success: true,
@@ -188,6 +270,18 @@ func (h *WhatsAppHandler) SendMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	userID, ok := middleware.GetUserID(r)
+	if !ok {
+		respondError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	waService, err := h.getOrCreateService(userID)
+	if err != nil {
+		respondError(w, fmt.Sprintf("Failed to get session: %v", err), http.StatusInternalServerError)
+		return
+	}
+
 	// Parse request body
 	var req types.SendRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -197,22 +291,12 @@ func (h *WhatsAppHandler) SendMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(req.Contacts) == 0 {
-		logger.Error("No contacts provided in request")
 		respondError(w, "No contacts provided", http.StatusBadRequest)
 		return
 	}
 
 	logger.Section("NEW SEND REQUEST")
-	logger.Info("📬 Total contacts: %d", len(req.Contacts))
-	msgPreview := req.Message.Text
-	if len(msgPreview) > 80 {
-		msgPreview = msgPreview[:80] + "..."
-	}
-	logger.Info("📝 Message template: \"%s\"", msgPreview)
-	logger.Info("👥 Contact list:")
-	for i, c := range req.Contacts {
-		logger.Info("   [%d] %s (%s)", i+1, c.Name, c.Phone)
-	}
+	logger.Info("📬 User %s | Total contacts: %d", userID, len(req.Contacts))
 
 	// Set headers for SSE
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -222,41 +306,38 @@ func (h *WhatsAppHandler) SendMessages(w http.ResponseWriter, r *http.Request) {
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		logger.Error("HTTP streaming not supported - ResponseWriter doesn't implement http.Flusher")
-		logger.Error("This usually means a middleware is wrapping the response writer incorrectly")
-		respondError(w, "Streaming unsupported - SSE not available", http.StatusInternalServerError)
+		respondError(w, "Streaming unsupported", http.StatusInternalServerError)
 		return
 	}
 
-	logger.Debug("HTTP Flusher available - SSE streaming ready")
-
-	// Check if client is ready
-	if !h.waService.IsReady() {
-		logger.Error("WhatsApp client not ready")
-		data, _ := json.Marshal(types.ProgressUpdate{
-			Type: "error",
-			Data: "WhatsApp client not ready",
-		})
+	if !waService.IsReady() {
+		data, _ := json.Marshal(types.ProgressUpdate{Type: "error", Data: "WhatsApp client not ready"})
 		fmt.Fprintf(w, "data: %s\n\n", data)
 		flusher.Flush()
 		return
 	}
 
-	logger.Success("WhatsApp client is ready. Starting to send messages...")
-
-	// Cleanup uploaded image after sending (if provided)
+	// Validate and cleanup uploaded image after sending
 	if req.Message.ImagePath != "" {
+		// Verify the image file exists before attempting to send
+		info, err := os.Stat(req.Message.ImagePath)
+		if err != nil {
+			logger.Error("Image file not found at path '%s': %v", req.Message.ImagePath, err)
+			data, _ := json.Marshal(types.ProgressUpdate{Type: "error", Data: fmt.Sprintf("Image file not found: %v", err)})
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+			return
+		}
+		logger.Info("Image file verified: %s (size: %d bytes)", req.Message.ImagePath, info.Size())
+
 		defer func() {
 			logger.Info("Cleaning up uploaded image: %s", req.Message.ImagePath)
 			if err := os.Remove(req.Message.ImagePath); err != nil {
 				logger.Warn("Failed to delete uploaded image: %v", err)
-			} else {
-				logger.Success("Uploaded image deleted successfully")
 			}
 		}()
 	}
 
-	// Send messages
 	progress := types.SendProgress{
 		Total:  len(req.Contacts),
 		Sent:   0,
@@ -270,70 +351,47 @@ func (h *WhatsAppHandler) SendMessages(w http.ResponseWriter, r *http.Request) {
 		logger.Section(fmt.Sprintf("MESSAGE %d/%d", i+1, len(req.Contacts)))
 		logger.WhatsAppSending(i+1, len(req.Contacts), contact.Name, contact.Phone)
 
-		// Replace {{name}} placeholder
+		// Replace {{name}} placeholder with contact name
 		message := strings.ReplaceAll(req.Message.Text, "{{name}}", contact.Name)
 		if req.Message.Link != "" {
 			message += "\n\n" + req.Message.Link
 		}
 
-		// Random delay between 3-5 seconds
-		delay := time.Duration(3000+rand.Intn(2000)) * time.Millisecond
-
-		// Only delay if this isn't the first message
+		// Random delay between 3-5 seconds (skip first message)
 		if i > 0 {
+			delay := time.Duration(3000+rand.Intn(2000)) * time.Millisecond
 			logger.WhatsAppDelay(delay)
 			time.Sleep(delay)
 		}
 
-		// Send message (with image if provided)
-		var err error
+		var sendErr error
 		if req.Message.ImagePath != "" {
-			// Send with uploaded image
-			logger.Info("Sending message with uploaded image: %s", req.Message.ImagePath)
-			err = h.waService.SendMessageWithImage(contact.Phone, message, req.Message.ImagePath)
+			sendErr = waService.SendMessageWithImage(contact.Phone, message, req.Message.ImagePath)
 		} else if req.Message.ImageURL != "" {
-			// Send with image URL
-			logger.Info("Sending message with image URL: %s", req.Message.ImageURL)
-			err = h.waService.SendMessageWithImageURL(contact.Phone, message, req.Message.ImageURL)
+			sendErr = waService.SendMessageWithImageURL(contact.Phone, message, req.Message.ImageURL)
 		} else {
-			// Send text-only message
-			err = h.waService.SendMessage(contact.Phone, message)
+			sendErr = waService.SendMessage(contact.Phone, message)
 		}
-		if err != nil {
+
+		if sendErr != nil {
 			progress.Failed++
-			errorMsg := fmt.Sprintf("%s (%s): %v", contact.Name, contact.Phone, err)
-			progress.Errors = append(progress.Errors, errorMsg)
-			logger.WhatsAppFailed(i+1, len(req.Contacts), contact.Name, contact.Phone, err)
+			progress.Errors = append(progress.Errors, fmt.Sprintf("%s (%s): %v", contact.Name, contact.Phone, sendErr))
+			logger.WhatsAppFailed(i+1, len(req.Contacts), contact.Name, contact.Phone, sendErr)
 		} else {
 			progress.Sent++
 			logger.WhatsAppSuccess(i+1, len(req.Contacts), contact.Name, contact.Phone, "N/A")
 		}
 
-		// Send progress update
-		data, _ := json.Marshal(types.ProgressUpdate{
-			Type: "progress",
-			Data: progress,
-		})
+		data, _ := json.Marshal(types.ProgressUpdate{Type: "progress", Data: progress})
 		fmt.Fprintf(w, "data: %s\n\n", data)
 		flusher.Flush()
 	}
 
-	// Send completion
 	logger.Section("SEND COMPLETE")
-	logger.Success("✅ Sent: %d | ❌ Failed: %d | 📊 Total: %d", progress.Sent, progress.Failed, progress.Total)
-
-	if len(progress.Errors) > 0 {
-		logger.Warn("Errors encountered:")
-		for i, err := range progress.Errors {
-			logger.Error("  [%d] %s", i+1, err)
-		}
-	}
+	logger.Success("✅ Sent: %d | ❌ Failed: %d | Total: %d", progress.Sent, progress.Failed, progress.Total)
 
 	progress.Current = nil
-	data, _ := json.Marshal(types.ProgressUpdate{
-		Type: "complete",
-		Data: progress,
-	})
+	data, _ := json.Marshal(types.ProgressUpdate{Type: "complete", Data: progress})
 	fmt.Fprintf(w, "data: %s\n\n", data)
 	flusher.Flush()
 }

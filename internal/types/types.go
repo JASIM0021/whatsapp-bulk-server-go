@@ -61,10 +61,71 @@ type WhatsAppStatus struct {
 
 // ImageUploadResponse represents the response for image upload
 type ImageUploadResponse struct {
-	Success   bool   `json:"success"`
-	FilePath  string `json:"filePath"`
-	FileName  string `json:"fileName"`
-	FileSize  int64  `json:"fileSize"`
-	MimeType  string `json:"mimeType"`
-	Error     string `json:"error,omitempty"`
+	Success  bool   `json:"success"`
+	FilePath string `json:"filePath"`
+	FileName string `json:"fileName"`
+	FileSize int64  `json:"fileSize"`
+	MimeType string `json:"mimeType"`
+	Error    string `json:"error,omitempty"`
 }
+
+// RegisterRequest is the request body for user registration
+type RegisterRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+	Name     string `json:"name"`
+}
+
+// LoginRequest is the request body for user login
+type LoginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+// AuthResponse is returned after successful login/register
+type AuthResponse struct {
+	Token string   `json:"token"`
+	User  UserInfo `json:"user"`
+}
+
+// UserInfo represents public user fields
+type UserInfo struct {
+	ID    string `json:"id"`
+	Email string `json:"email"`
+	Name  string `json:"name"`
+	Role  string `json:"role"`
+}
+
+// Template represents a message template
+type Template struct {
+	ID        string   `json:"id"`
+	UserID    string   `json:"userId"`
+	Name      string   `json:"name"`
+	Category  string   `json:"category"`
+	Body      string   `json:"body"`
+	Variables []string `json:"variables"`
+	IsDefault bool     `json:"isDefault"`
+	CreatedAt string   `json:"createdAt"`
+}
+
+// CreateTemplateRequest is the request body for creating a template
+type CreateTemplateRequest struct {
+	Name      string   `json:"name"`
+	Category  string   `json:"category"`
+	Body      string   `json:"body"`
+	Variables []string `json:"variables"`
+}
+
+// UpdateTemplateRequest is the request body for updating a template
+type UpdateTemplateRequest struct {
+	Name      string   `json:"name"`
+	Category  string   `json:"category"`
+	Body      string   `json:"body"`
+	Variables []string `json:"variables"`
+}
+
+// contextKey is the type for context keys to avoid collisions
+type contextKey string
+
+// UserIDKey is the context key for the authenticated user's ID (string ObjectID hex)
+const UserIDKey contextKey = "userID"
