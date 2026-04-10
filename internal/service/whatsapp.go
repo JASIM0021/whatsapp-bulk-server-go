@@ -16,6 +16,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/skip2/go-qrcode"
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -61,6 +62,11 @@ func NewWhatsAppService() (*WhatsAppService, error) {
 		dbPath = "./whatsapp_session.db"
 	}
 	return NewWhatsAppServiceWithPath(dbPath, "", nil)
+}
+
+func init() {
+	// Set device name shown in WhatsApp's "Linked Devices" list
+	store.SetOSInfo("BulkSend", [3]uint32{1, 0, 0})
 }
 
 func NewWhatsAppServiceWithPath(dbPath, userID string, database *db.DB) (*WhatsAppService, error) {
@@ -211,37 +217,14 @@ func (s *WhatsAppService) Initialize() error {
 	s.client = whatsmeow.NewClient(deviceStore, clientLog)
 	s.client.AddEventHandler(s.handleEvents)
 
-	qrChan, err := s.client.GetQRChannel(context.Background())
-	if err != nil {
-		logger.Error("Failed to get QR channel: %v", err)
-		return fmt.Errorf("failed to get QR channel: %w", err)
-	}
-
-	go func() {
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				logger.Info("New QR code generated")
-				qrCode, err := s.generateQRDataURL(evt.Code)
-				if err == nil {
-					s.mu.Lock()
-					s.lastQR = qrCode
-					s.mu.Unlock()
-					select {
-					case s.qrChan <- qrCode:
-					default:
-					}
-				}
-			}
-		}
-	}()
-
-	if err := s.client.Connect(); err != nil {
-		logger.Error("Failed to connect to WhatsApp: %v", err)
-		return fmt.Errorf("failed to connect: %w", err)
-	}
-
 	if hasSession {
-		logger.Info("Attempting to reconnect with existing session...")
+		// Existing session — just connect, no QR needed
+		logger.Info("Reconnecting with existing session...")
+		if err := s.client.Connect(); err != nil {
+			logger.Error("Failed to connect to WhatsApp: %v", err)
+			return fmt.Errorf("failed to connect: %w", err)
+		}
+
 		time.Sleep(3 * time.Second)
 		if s.isReady {
 			logger.Success("Reconnected with existing session!")
@@ -250,10 +233,39 @@ func (s *WhatsAppService) Initialize() error {
 			default:
 			}
 		} else {
-			logger.Warn("Existing session could not reconnect — waiting for QR code...")
+			logger.Warn("Existing session could not reconnect — may need to re-login")
 		}
 	} else {
-		logger.Info("No existing session — QR code will be generated shortly")
+		// No session — get QR channel for new login
+		logger.Info("No existing session — generating QR code for new login")
+		qrChan, err := s.client.GetQRChannel(context.Background())
+		if err != nil {
+			logger.Error("Failed to get QR channel: %v", err)
+			return fmt.Errorf("failed to get QR channel: %w", err)
+		}
+
+		go func() {
+			for evt := range qrChan {
+				if evt.Event == "code" {
+					logger.Info("New QR code generated")
+					qrCode, err := s.generateQRDataURL(evt.Code)
+					if err == nil {
+						s.mu.Lock()
+						s.lastQR = qrCode
+						s.mu.Unlock()
+						select {
+						case s.qrChan <- qrCode:
+						default:
+						}
+					}
+				}
+			}
+		}()
+
+		if err := s.client.Connect(); err != nil {
+			logger.Error("Failed to connect to WhatsApp: %v", err)
+			return fmt.Errorf("failed to connect: %w", err)
+		}
 	}
 
 	return nil

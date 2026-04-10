@@ -90,10 +90,11 @@ type AuthResponse struct {
 
 // UserInfo represents public user fields
 type UserInfo struct {
-	ID    string `json:"id"`
-	Email string `json:"email"`
-	Name  string `json:"name"`
-	Role  string `json:"role"`
+	ID           string            `json:"id"`
+	Email        string            `json:"email"`
+	Name         string            `json:"name"`
+	Role         string            `json:"role"`
+	Subscription *SubscriptionInfo `json:"subscription,omitempty"`
 }
 
 // Template represents a message template
@@ -122,6 +123,70 @@ type UpdateTemplateRequest struct {
 	Category  string   `json:"category"`
 	Body      string   `json:"body"`
 	Variables []string `json:"variables"`
+}
+
+// Subscription plan constants
+const (
+	PlanFree    = "free"
+	PlanMonthly = "monthly"
+	PlanYearly  = "yearly"
+)
+
+// Subscription represents a user's current subscription state
+type Subscription struct {
+	ID        string `json:"id"`
+	UserID    string `json:"userId"`
+	Plan      string `json:"plan"`
+	Status    string `json:"status"`
+	StartDate string `json:"startDate"`
+	ExpiryDate string `json:"expiryDate"`
+	CreatedAt string `json:"createdAt"`
+}
+
+// SubscriptionInfo is the public subscription data returned by APIs
+type SubscriptionInfo struct {
+	Plan       string `json:"plan"`
+	Status     string `json:"status"`
+	ExpiryDate string `json:"expiryDate"`
+	IsActive   bool   `json:"isActive"`
+	DaysLeft   int    `json:"daysLeft"`
+}
+
+// Payment represents a single payment record
+type Payment struct {
+	ID           string  `json:"id"`
+	UserID       string  `json:"userId"`
+	TxnID        string  `json:"txnId"`
+	Amount       float64 `json:"amount"`
+	Plan         string  `json:"plan"`
+	Status       string  `json:"status"`
+	MihpayID     string  `json:"mihpayId,omitempty"`
+	CreatedAt    string  `json:"createdAt"`
+}
+
+// InitiatePaymentRequest is the frontend request to start a payment
+type InitiatePaymentRequest struct {
+	Plan string `json:"plan"`
+}
+
+// PayUFormData is returned to frontend to build the hidden form POST to PayU
+type PayUFormData struct {
+	Action      string `json:"action"`
+	Key         string `json:"key"`
+	TxnID       string `json:"txnid"`
+	Amount      string `json:"amount"`
+	ProductInfo string `json:"productinfo"`
+	FirstName   string `json:"firstname"`
+	Email       string `json:"email"`
+	Phone       string `json:"phone"`
+	Surl        string `json:"surl"`
+	Furl        string `json:"furl"`
+	Hash        string `json:"hash"`
+	Udf1        string `json:"udf1"`
+	Udf2        string `json:"udf2"`
+	Udf3        string `json:"udf3"`
+	Udf4        string `json:"udf4"`
+	Udf5        string `json:"udf5"`
 }
 
 // contextKey is the type for context keys to avoid collisions

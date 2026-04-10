@@ -17,11 +17,17 @@ import (
 )
 
 type AuthService struct {
-	db *db.DB
+	db     *db.DB
+	subSvc *SubscriptionService
 }
 
 func NewAuthService(database *db.DB) *AuthService {
 	return &AuthService{db: database}
+}
+
+// SetSubscriptionService sets the subscription service reference (avoids circular init).
+func (s *AuthService) SetSubscriptionService(subSvc *SubscriptionService) {
+	s.subSvc = subSvc
 }
 
 // userDoc is the MongoDB document shape for the users collection.
@@ -59,14 +65,25 @@ func (s *AuthService) Register(ctx context.Context, req types.RegisterRequest) (
 	templateSvc := NewTemplateService(s.db)
 	_ = templateSvc.seedDefaultTemplates(ctx, userID)
 
+	// Create free 7-day trial subscription (non-fatal)
+	if s.subSvc != nil {
+		_ = s.subSvc.CreateTrialSubscription(ctx, userID)
+	}
+
 	token, err := s.GenerateToken(userID, req.Email, "user")
 	if err != nil {
 		return nil, err
 	}
 
+	userInfo := types.UserInfo{ID: userID, Email: req.Email, Name: req.Name, Role: "user"}
+	if s.subSvc != nil {
+		subInfo, _ := s.subSvc.GetSubscription(ctx, userID)
+		userInfo.Subscription = subInfo
+	}
+
 	return &types.AuthResponse{
 		Token: token,
-		User:  types.UserInfo{ID: userID, Email: req.Email, Name: req.Name, Role: "user"},
+		User:  userInfo,
 	}, nil
 }
 
@@ -90,9 +107,15 @@ func (s *AuthService) Login(ctx context.Context, req types.LoginRequest) (*types
 		return nil, err
 	}
 
+	userInfo := types.UserInfo{ID: userID, Email: doc.Email, Name: doc.Name, Role: doc.Role}
+	if s.subSvc != nil {
+		subInfo, _ := s.subSvc.GetSubscription(ctx, userID)
+		userInfo.Subscription = subInfo
+	}
+
 	return &types.AuthResponse{
 		Token: token,
-		User:  types.UserInfo{ID: userID, Email: doc.Email, Name: doc.Name, Role: doc.Role},
+		User:  userInfo,
 	}, nil
 }
 
@@ -103,6 +126,20 @@ func (s *AuthService) GetUser(ctx context.Context, userID string) (*types.UserIn
 	}
 	var doc userDoc
 	if err := s.db.Users().FindOne(ctx, bson.M{"_id": oid}).Decode(&doc); err != nil {
+		return nil, fmt.Errorf("user not found")
+	}
+	userInfo := &types.UserInfo{ID: doc.ID.Hex(), Email: doc.Email, Name: doc.Name, Role: doc.Role}
+	if s.subSvc != nil {
+		subInfo, _ := s.subSvc.GetSubscription(ctx, doc.ID.Hex())
+		userInfo.Subscription = subInfo
+	}
+	return userInfo, nil
+}
+
+// GetUserByEmail looks up a user by email and returns their info.
+func (s *AuthService) GetUserByEmail(ctx context.Context, email string) (*types.UserInfo, error) {
+	var doc userDoc
+	if err := s.db.Users().FindOne(ctx, bson.M{"email": email}).Decode(&doc); err != nil {
 		return nil, fmt.Errorf("user not found")
 	}
 	return &types.UserInfo{ID: doc.ID.Hex(), Email: doc.Email, Name: doc.Name, Role: doc.Role}, nil

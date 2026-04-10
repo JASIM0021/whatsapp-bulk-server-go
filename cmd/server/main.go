@@ -51,6 +51,8 @@ func main() {
 
 	// Initialize services first (needed for seeding)
 	authService := service.NewAuthService(appDB)
+	subscriptionService := service.NewSubscriptionService(appDB)
+	authService.SetSubscriptionService(subscriptionService)
 	templateService := service.NewTemplateService(appDB)
 
 	// Seed default user if not exists
@@ -63,6 +65,11 @@ func main() {
 	userResp, err := authService.Register(context.Background(), seedUser)
 	if err != nil {
 		logger.Info("Default user already exists")
+		// Ensure existing users have a trial subscription — reset if expired
+		existingUser, _ := authService.GetUserByEmail(context.Background(), "user1@gmail.com")
+		if existingUser != nil {
+			_ = subscriptionService.EnsureTrialSubscription(context.Background(), existingUser.ID)
+		}
 	} else {
 		logger.Success("Created default user: user1@gmail.com / 123456")
 	}
@@ -86,14 +93,20 @@ func main() {
 	// Initialize handlers
 	authHandler := handler.NewAuthHandler(authService)
 	templateHandler := handler.NewTemplateHandler(templateService)
+	subscriptionHandler := handler.NewSubscriptionHandler(subscriptionService, authService)
 	whatsappHandler := handler.NewWhatsAppHandler("sessions", appDB)
 	uploadHandler := handler.NewUploadHandler()
 	imageHandler := handler.NewImageHandler()
 
 	// Auth middleware helper
 	authMiddleware := middleware.Auth(authService)
+	subMiddleware := middleware.RequireSubscription(subscriptionService)
 	wrap := func(h http.HandlerFunc) http.Handler {
 		return authMiddleware(http.HandlerFunc(h))
+	}
+	// wrapSub applies auth + subscription check
+	wrapSub := func(h http.HandlerFunc) http.Handler {
+		return authMiddleware(subMiddleware(http.HandlerFunc(h)))
 	}
 
 	// Create HTTP mux
@@ -108,32 +121,46 @@ func main() {
 	mux.HandleFunc("/api/auth/register", authHandler.Register)
 	mux.HandleFunc("/api/auth/login", authHandler.Login)
 
-	// Protected routes
+	// PayU callback routes (PUBLIC — no JWT, security via hash verification)
+	mux.HandleFunc("/api/payment/success", subscriptionHandler.PaymentSuccess)
+	mux.HandleFunc("/api/payment/failure", subscriptionHandler.PaymentFailure)
+
+	// Protected routes (auth only)
 	mux.Handle("/api/auth/me", wrap(authHandler.Me))
-	mux.Handle("/api/whatsapp/init", wrap(whatsappHandler.Initialize))
-	mux.Handle("/api/whatsapp/qr", wrap(whatsappHandler.GetQRCode))
-	mux.Handle("/api/whatsapp/status", wrap(whatsappHandler.GetStatus))
-	mux.Handle("/api/whatsapp/disconnect", wrap(whatsappHandler.Disconnect))
-	mux.Handle("/api/whatsapp/send", wrap(whatsappHandler.SendMessages))
-	mux.Handle("/api/upload", wrap(uploadHandler.UploadFile))
-	mux.Handle("/api/upload/image", wrap(imageHandler.UploadImage))
-	mux.Handle("/api/templates", wrap(templateHandler.HandleCollection))
-	mux.Handle("/api/templates/", wrap(templateHandler.Single))
+	mux.Handle("/api/subscription", wrap(subscriptionHandler.GetSubscription))
+	mux.Handle("/api/payment/initiate", wrap(subscriptionHandler.InitiatePayment))
+	mux.Handle("/api/payment/history", wrap(subscriptionHandler.GetPaymentHistory))
+
+	// Protected routes (auth + active subscription required)
+	mux.Handle("/api/whatsapp/init", wrapSub(whatsappHandler.Initialize))
+	mux.Handle("/api/whatsapp/qr", wrapSub(whatsappHandler.GetQRCode))
+	mux.Handle("/api/whatsapp/status", wrap(whatsappHandler.GetStatus)) // status check doesn't need subscription
+	mux.Handle("/api/whatsapp/disconnect", wrap(whatsappHandler.Disconnect)) // allow disconnect always
+	mux.Handle("/api/whatsapp/send", wrapSub(whatsappHandler.SendMessages))
+	mux.Handle("/api/upload", wrapSub(uploadHandler.UploadFile))
+	mux.Handle("/api/upload/image", wrapSub(imageHandler.UploadImage))
+	mux.Handle("/api/templates", wrapSub(templateHandler.HandleCollection))
+	mux.Handle("/api/templates/", wrapSub(templateHandler.Single))
 
 	logger.Info("Registered API routes:")
 	logger.Info("  • GET  /api/health")
 	logger.Info("  • POST /api/auth/register")
 	logger.Info("  • POST /api/auth/login")
 	logger.Info("  • GET  /api/auth/me  [protected]")
-	logger.Info("  • POST /api/whatsapp/init  [protected]")
-	logger.Info("  • GET  /api/whatsapp/qr  [protected]")
-	logger.Info("  • GET  /api/whatsapp/status  [protected]")
-	logger.Info("  • POST /api/whatsapp/disconnect  [protected]")
-	logger.Info("  • POST /api/whatsapp/send  [protected]")
-	logger.Info("  • POST /api/upload  [protected]")
-	logger.Info("  • POST /api/upload/image  [protected]")
-	logger.Info("  • GET/POST /api/templates  [protected]")
-	logger.Info("  • PUT/DELETE /api/templates/{id}  [protected]")
+	logger.Info("  • GET  /api/subscription  [protected]")
+	logger.Info("  • POST /api/payment/initiate  [protected]")
+	logger.Info("  • POST /api/payment/success  [public - PayU callback]")
+	logger.Info("  • POST /api/payment/failure  [public - PayU callback]")
+	logger.Info("  • GET  /api/payment/history  [protected]")
+	logger.Info("  • POST /api/whatsapp/init  [protected+subscription]")
+	logger.Info("  • GET  /api/whatsapp/qr  [protected+subscription]")
+	logger.Info("  • GET  /api/whatsapp/status  [protected+subscription]")
+	logger.Info("  • POST /api/whatsapp/disconnect  [protected+subscription]")
+	logger.Info("  • POST /api/whatsapp/send  [protected+subscription]")
+	logger.Info("  • POST /api/upload  [protected+subscription]")
+	logger.Info("  • POST /api/upload/image  [protected+subscription]")
+	logger.Info("  • GET/POST /api/templates  [protected+subscription]")
+	logger.Info("  • PUT/DELETE /api/templates/{id}  [protected+subscription]")
 
 	// Apply CORS + Logging middleware
 	handlerWithMiddleware := middleware.Logging(middleware.CORS(mux))
