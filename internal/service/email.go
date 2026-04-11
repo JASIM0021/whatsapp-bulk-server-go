@@ -61,7 +61,7 @@ func (s *EmailService) SendWelcomeEmail(toEmail, userName string) error {
             </ul>
             <table cellpadding="0" cellspacing="0" style="margin:0 auto 24px;">
               <tr><td style="background-color:#16a34a;border-radius:8px;padding:14px 32px;text-align:center;">
-                <a href="https://bulksender.app" style="color:#ffffff;text-decoration:none;font-size:16px;font-weight:600;">Start Sending Messages</a>
+                <a href="https://bulksender.todayintech.in" style="color:#ffffff;text-decoration:none;font-size:16px;font-weight:600;">Start Sending Messages</a>
               </td></tr>
             </table>
             <p style="margin:0;color:#71717a;font-size:14px;line-height:1.5;">
