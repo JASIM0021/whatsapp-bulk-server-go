@@ -14,6 +14,7 @@ func CORS(next http.Handler) http.Handler {
 			"http://localhost:3001",
 			"http://localhost:5173",
 			"http://localhost:5174",
+			"https://bulksender.todayintech.in",
 		}
 
 		if frontendURL := os.Getenv("FRONTEND_URL"); frontendURL != "" {
