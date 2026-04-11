@@ -222,22 +222,55 @@ func (s *WhatsAppService) Initialize() error {
 		logger.Info("Reconnecting with existing session...")
 		if err := s.client.Connect(); err != nil {
 			logger.Error("Failed to connect to WhatsApp: %v", err)
-			return fmt.Errorf("failed to connect: %w", err)
+			// Connection failed — clear stale session and fall through to QR
+			logger.Info("Clearing stale session and falling through to QR generation...")
+			s.client.Disconnect()
+			if deviceStore.ID != nil {
+				_ = deviceStore.Delete(context.Background())
+			}
+			s.client = nil
+			s.isReady = false
+			s.lastQR = ""
+			hasSession = false
+		} else {
+			// Wait for Connected event
+			time.Sleep(3 * time.Second)
+			if s.isReady {
+				logger.Success("Reconnected with existing session!")
+				select {
+				case s.readyChan <- true:
+				default:
+				}
+			} else {
+				// Session exists but failed to become ready — stale session
+				logger.Warn("Existing session could not reconnect — clearing and generating new QR")
+				s.client.Disconnect()
+				if deviceStore.ID != nil {
+					_ = deviceStore.Delete(context.Background())
+				}
+				s.client = nil
+				s.isReady = false
+				s.lastQR = ""
+				hasSession = false
+			}
+		}
+	}
+
+	if !hasSession {
+		// No session (or stale session cleared) — get QR channel for new login
+		logger.Info("Generating QR code for new login...")
+
+		// Re-create device store if we cleared a stale one
+		if s.client == nil {
+			deviceStore, err = s.container.GetFirstDevice(context.Background())
+			if err != nil {
+				return fmt.Errorf("failed to get device: %w", err)
+			}
+			clientLog := waLog.Stdout("WhatsApp", "ERROR", true)
+			s.client = whatsmeow.NewClient(deviceStore, clientLog)
+			s.client.AddEventHandler(s.handleEvents)
 		}
 
-		time.Sleep(3 * time.Second)
-		if s.isReady {
-			logger.Success("Reconnected with existing session!")
-			select {
-			case s.readyChan <- true:
-			default:
-			}
-		} else {
-			logger.Warn("Existing session could not reconnect — may need to re-login")
-		}
-	} else {
-		// No session — get QR channel for new login
-		logger.Info("No existing session — generating QR code for new login")
 		qrChan, err := s.client.GetQRChannel(context.Background())
 		if err != nil {
 			logger.Error("Failed to get QR channel: %v", err)
