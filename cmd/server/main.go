@@ -98,9 +98,11 @@ func main() {
 	templateHandler := handler.NewTemplateHandler(templateService)
 	subscriptionHandler := handler.NewSubscriptionHandler(subscriptionService, authService)
 	whatsappHandler := handler.NewWhatsAppHandler("sessions", appDB)
+	whatsappHandler.SetSubscriptionService(subscriptionService)
 	uploadHandler := handler.NewUploadHandler()
 	imageHandler := handler.NewImageHandler()
 	adminHandler := handler.NewAdminHandler(appDB.MongoDB(), authService, emailService)
+	contactsHandler := handler.NewContactsHandler(appDB)
 
 	// Auth middleware helper
 	authMiddleware := middleware.Auth(authService)
@@ -145,6 +147,10 @@ func main() {
 	mux.Handle("/api/upload/image", wrapSub(imageHandler.UploadImage))
 	mux.Handle("/api/templates", wrapSub(templateHandler.HandleCollection))
 	mux.Handle("/api/templates/", wrapSub(templateHandler.Single))
+
+	// Contacts book (auth only — no subscription gate)
+	mux.Handle("/api/contacts", wrap(contactsHandler.HandleCollection))
+	mux.Handle("/api/contacts/", wrap(contactsHandler.HandleSingle))
 
 	// Admin routes (auth + admin role required)
 	adminMiddleware := middleware.AdminOnly(appDB.MongoDB())

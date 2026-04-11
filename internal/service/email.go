@@ -30,7 +30,7 @@ func NewEmailService() *EmailService {
 
 // SendWelcomeEmail sends a branded HTML welcome email after user registration.
 func (s *EmailService) SendWelcomeEmail(toEmail, userName string) error {
-	subject := "Welcome to WhatsApp Bulk Sender — Your 7-Day Free Trial Starts Now!"
+	subject := "Welcome to WhatsApp Bulk Sender — Your Free Trial Starts Now!"
 
 	htmlBody := fmt.Sprintf(`<!DOCTYPE html>
 <html>
@@ -50,7 +50,7 @@ func (s *EmailService) SendWelcomeEmail(toEmail, userName string) error {
           <td style="padding:40px;">
             <h2 style="margin:0 0 16px;color:#18181b;font-size:22px;">Welcome aboard, %s!</h2>
             <p style="margin:0 0 16px;color:#3f3f46;font-size:16px;line-height:1.6;">
-              We're excited to have you. Your account is now active with a <strong>free 7-day trial</strong> that gives you full access to every feature.
+              We're excited to have you. Your account is now active with a <strong>free trial of 50 bulk messages</strong> that gives you full access to every feature.
             </p>
             <p style="margin:0 0 8px;color:#3f3f46;font-size:16px;line-height:1.6;">Here's what you can do right away:</p>
             <ul style="margin:0 0 24px;padding-left:20px;color:#3f3f46;font-size:15px;line-height:1.8;">
@@ -65,7 +65,7 @@ func (s *EmailService) SendWelcomeEmail(toEmail, userName string) error {
               </td></tr>
             </table>
             <p style="margin:0;color:#71717a;font-size:14px;line-height:1.5;">
-              Your trial expires in 7 days. Upgrade anytime to keep using all features without interruption.
+              Your free trial includes 50 messages. Upgrade anytime for unlimited messaging.
             </p>
           </td>
         </tr>

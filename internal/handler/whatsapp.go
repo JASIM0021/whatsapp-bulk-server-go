@@ -19,10 +19,11 @@ import (
 )
 
 type WhatsAppHandler struct {
-	mu       sync.RWMutex
-	services map[string]*service.WhatsAppService
-	dbDir    string
-	db       *appdb.DB
+	mu         sync.RWMutex
+	services   map[string]*service.WhatsAppService
+	dbDir      string
+	db         *appdb.DB
+	subService *service.SubscriptionService
 }
 
 func NewWhatsAppHandler(dbDir string, database *appdb.DB) *WhatsAppHandler {
@@ -33,6 +34,11 @@ func NewWhatsAppHandler(dbDir string, database *appdb.DB) *WhatsAppHandler {
 		dbDir:    absDir,
 		db:       database,
 	}
+}
+
+// SetSubscriptionService sets the subscription service for message quota tracking.
+func (h *WhatsAppHandler) SetSubscriptionService(subSvc *service.SubscriptionService) {
+	h.subService = subSvc
 }
 
 // Shutdown disconnects all active WhatsApp sessions.
@@ -305,6 +311,25 @@ func (h *WhatsAppHandler) SendMessages(w http.ResponseWriter, r *http.Request) {
 	logger.Section("NEW SEND REQUEST")
 	logger.Info("📬 User %s | Total contacts: %d", userID, len(req.Contacts))
 
+	// Check message quota for free-plan users
+	if h.subService != nil {
+		remaining, err := h.subService.CheckMessageQuota(r.Context(), userID)
+		if err != nil {
+			logger.Error("Failed to check message quota for user %s: %v", userID, err)
+			respondError(w, "Failed to check message quota", http.StatusInternalServerError)
+			return
+		}
+		if remaining == 0 {
+			respondError(w, "Free trial message limit reached. Please upgrade your plan.", http.StatusForbidden)
+			return
+		}
+		// If remaining is positive (free plan), cap contacts to remaining quota
+		if remaining > 0 && len(req.Contacts) > remaining {
+			logger.Warn("User %s requested %d messages but only %d remaining, capping", userID, len(req.Contacts), remaining)
+			req.Contacts = req.Contacts[:remaining]
+		}
+	}
+
 	// Set headers for SSE
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -388,6 +413,10 @@ func (h *WhatsAppHandler) SendMessages(w http.ResponseWriter, r *http.Request) {
 		} else {
 			progress.Sent++
 			logger.WhatsAppSuccess(i+1, len(req.Contacts), contact.Name, contact.Phone, "N/A")
+			// Increment message count for free-plan users
+			if h.subService != nil {
+				h.subService.IncrementMessageCount(r.Context(), userID, 1)
+			}
 		}
 
 		data, _ := json.Marshal(types.ProgressUpdate{Type: "progress", Data: progress})

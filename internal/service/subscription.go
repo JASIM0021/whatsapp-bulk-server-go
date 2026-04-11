@@ -32,14 +32,19 @@ var planDuration = map[string]time.Duration{
 	"yearly":  365 * 24 * time.Hour,
 }
 
+// Free trial message limit
+const FreeMessageLimit = 50
+
 type subscriptionDoc struct {
-	ID         primitive.ObjectID `bson:"_id,omitempty"`
-	UserID     primitive.ObjectID `bson:"user_id"`
-	Plan       string             `bson:"plan"`
-	Status     string             `bson:"status"`
-	StartDate  time.Time          `bson:"start_date"`
-	ExpiryDate time.Time          `bson:"expiry_date"`
-	CreatedAt  time.Time          `bson:"created_at"`
+	ID           primitive.ObjectID `bson:"_id,omitempty"`
+	UserID       primitive.ObjectID `bson:"user_id"`
+	Plan         string             `bson:"plan"`
+	Status       string             `bson:"status"`
+	StartDate    time.Time          `bson:"start_date"`
+	ExpiryDate   time.Time          `bson:"expiry_date"`
+	CreatedAt    time.Time          `bson:"created_at"`
+	MessagesUsed int                `bson:"messages_used"`
+	MessageLimit int                `bson:"message_limit"`
 }
 
 type paymentDoc struct {
@@ -92,7 +97,7 @@ func (s *SubscriptionService) SetEmailService(emailSvc *EmailService) {
 	s.emailSvc = emailSvc
 }
 
-// CreateTrialSubscription creates a free 7-day trial for a new user.
+// CreateTrialSubscription creates a free trial with 50 message limit for a new user.
 func (s *SubscriptionService) CreateTrialSubscription(ctx context.Context, userID string) error {
 	oid, err := primitive.ObjectIDFromHex(userID)
 	if err != nil {
@@ -100,14 +105,17 @@ func (s *SubscriptionService) CreateTrialSubscription(ctx context.Context, userI
 	}
 
 	now := time.Now()
+	// Free trial: no time expiry, limited by message count (50 messages)
 	doc := subscriptionDoc{
-		ID:         primitive.NewObjectID(),
-		UserID:     oid,
-		Plan:       types.PlanFree,
-		Status:     "active",
-		StartDate:  now,
-		ExpiryDate: now.Add(planDuration["free"]),
-		CreatedAt:  now,
+		ID:           primitive.NewObjectID(),
+		UserID:       oid,
+		Plan:         types.PlanFree,
+		Status:       "active",
+		StartDate:    now,
+		ExpiryDate:   now.Add(100 * 365 * 24 * time.Hour), // far future — free plan doesn't expire by time
+		CreatedAt:    now,
+		MessagesUsed: 0,
+		MessageLimit: FreeMessageLimit,
 	}
 
 	_, err = s.db.Subscriptions().InsertOne(ctx, doc)
@@ -118,13 +126,12 @@ func (s *SubscriptionService) CreateTrialSubscription(ctx context.Context, userI
 		}
 		return fmt.Errorf("failed to create trial: %w", err)
 	}
-	logger.Info("Created 7-day free trial for user %s (expires: %s)", userID, doc.ExpiryDate.Format("2006-01-02"))
+	logger.Info("Created free trial for user %s (%d messages)", userID, FreeMessageLimit)
 	return nil
 }
 
-// EnsureTrialSubscription creates a trial if no subscription exists,
-// or resets an expired free-plan subscription back to a fresh 7-day trial.
-// Used for seeded/dev users who may have stale expired trials.
+// EnsureTrialSubscription creates a trial if no subscription exists.
+// For existing free plans, ensures message_limit field is set.
 func (s *SubscriptionService) EnsureTrialSubscription(ctx context.Context, userID string) error {
 	oid, err := primitive.ObjectIDFromHex(userID)
 	if err != nil {
@@ -140,21 +147,20 @@ func (s *SubscriptionService) EnsureTrialSubscription(ctx context.Context, userI
 		return fmt.Errorf("database error: %w", err)
 	}
 
-	// If it's a free plan that's expired, reset to a fresh 7-day trial
-	if doc.Plan == types.PlanFree && (doc.Status == "expired" || !doc.ExpiryDate.After(time.Now())) {
-		now := time.Now()
+	// Migrate old free plans: ensure message_limit is set
+	if doc.Plan == types.PlanFree && doc.MessageLimit == 0 {
 		_, err = s.db.Subscriptions().UpdateOne(ctx,
 			bson.M{"_id": doc.ID},
 			bson.M{"$set": bson.M{
-				"status":      "active",
-				"start_date":  now,
-				"expiry_date": now.Add(planDuration["free"]),
+				"status":        "active",
+				"message_limit": FreeMessageLimit,
+				"expiry_date":   time.Now().Add(100 * 365 * 24 * time.Hour),
 			}},
 		)
 		if err != nil {
-			return fmt.Errorf("failed to reset trial: %w", err)
+			return fmt.Errorf("failed to migrate trial: %w", err)
 		}
-		logger.Info("Reset free trial for user %s (new expiry: %s)", userID, now.Add(planDuration["free"]).Format("2006-01-02"))
+		logger.Info("Migrated free trial for user %s to message-based (%d limit)", userID, FreeMessageLimit)
 	}
 	return nil
 }
@@ -171,10 +177,12 @@ func (s *SubscriptionService) GetSubscription(ctx context.Context, userID string
 	if err == mongo.ErrNoDocuments {
 		// No subscription — return expired free plan
 		return &types.SubscriptionInfo{
-			Plan:     types.PlanFree,
-			Status:   "expired",
-			IsActive: false,
-			DaysLeft: 0,
+			Plan:         types.PlanFree,
+			Status:       "expired",
+			IsActive:     false,
+			DaysLeft:     0,
+			MessagesUsed: 0,
+			MessageLimit: FreeMessageLimit,
 		}, nil
 	}
 	if err != nil {
@@ -182,16 +190,31 @@ func (s *SubscriptionService) GetSubscription(ctx context.Context, userID string
 	}
 
 	now := time.Now()
-	isActive := doc.Status == "active" && doc.ExpiryDate.After(now)
+	isActive := doc.Status == "active"
 
-	// Auto-expire if time is up
-	if doc.Status == "active" && !doc.ExpiryDate.After(now) {
-		s.db.Subscriptions().UpdateOne(ctx, bson.M{"_id": doc.ID}, bson.M{"$set": bson.M{"status": "expired"}})
-		isActive = false
+	if doc.Plan == types.PlanFree {
+		// Free plan: active if messages not exhausted
+		limit := doc.MessageLimit
+		if limit == 0 {
+			limit = FreeMessageLimit
+		}
+		if doc.MessagesUsed >= limit {
+			isActive = false
+			if doc.Status == "active" {
+				s.db.Subscriptions().UpdateOne(ctx, bson.M{"_id": doc.ID}, bson.M{"$set": bson.M{"status": "expired"}})
+			}
+		}
+	} else {
+		// Paid plans: active if time not expired
+		isActive = doc.Status == "active" && doc.ExpiryDate.After(now)
+		if doc.Status == "active" && !doc.ExpiryDate.After(now) {
+			s.db.Subscriptions().UpdateOne(ctx, bson.M{"_id": doc.ID}, bson.M{"$set": bson.M{"status": "expired"}})
+			isActive = false
+		}
 	}
 
 	daysLeft := 0
-	if isActive {
+	if isActive && doc.Plan != types.PlanFree {
 		daysLeft = int(math.Ceil(doc.ExpiryDate.Sub(now).Hours() / 24))
 	}
 
@@ -200,12 +223,19 @@ func (s *SubscriptionService) GetSubscription(ctx context.Context, userID string
 		status = "expired"
 	}
 
+	messageLimit := doc.MessageLimit
+	if doc.Plan == types.PlanFree && messageLimit == 0 {
+		messageLimit = FreeMessageLimit
+	}
+
 	return &types.SubscriptionInfo{
-		Plan:       doc.Plan,
-		Status:     status,
-		ExpiryDate: doc.ExpiryDate.Format("2006-01-02"),
-		IsActive:   isActive,
-		DaysLeft:   daysLeft,
+		Plan:         doc.Plan,
+		Status:       status,
+		ExpiryDate:   doc.ExpiryDate.Format("2006-01-02"),
+		IsActive:     isActive,
+		DaysLeft:     daysLeft,
+		MessagesUsed: doc.MessagesUsed,
+		MessageLimit: messageLimit,
 	}, nil
 }
 
@@ -216,6 +246,74 @@ func (s *SubscriptionService) IsSubscriptionActive(ctx context.Context, userID s
 		return false, err
 	}
 	return info.IsActive, nil
+}
+
+// IncrementMessageCount increments the message count for a free-plan user.
+// Returns (messagesUsed, messageLimit, error). For paid plans this is a no-op.
+func (s *SubscriptionService) IncrementMessageCount(ctx context.Context, userID string, count int) (int, int, error) {
+	oid, err := primitive.ObjectIDFromHex(userID)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid user ID")
+	}
+
+	var doc subscriptionDoc
+	err = s.db.Subscriptions().FindOne(ctx, bson.M{"user_id": oid}).Decode(&doc)
+	if err != nil {
+		return 0, 0, fmt.Errorf("subscription not found")
+	}
+
+	// Only track for free plan
+	if doc.Plan != types.PlanFree {
+		return 0, 0, nil // unlimited for paid plans
+	}
+
+	limit := doc.MessageLimit
+	if limit == 0 {
+		limit = FreeMessageLimit
+	}
+
+	newCount := doc.MessagesUsed + count
+	update := bson.M{"$set": bson.M{"messages_used": newCount}}
+	if newCount >= limit {
+		update["$set"].(bson.M)["status"] = "expired"
+	}
+
+	_, err = s.db.Subscriptions().UpdateOne(ctx, bson.M{"_id": doc.ID}, update)
+	if err != nil {
+		return doc.MessagesUsed, limit, fmt.Errorf("failed to update message count: %w", err)
+	}
+
+	return newCount, limit, nil
+}
+
+// CheckMessageQuota checks if a free-plan user has enough messages remaining.
+// Returns (remaining, error). For paid plans returns -1 (unlimited).
+func (s *SubscriptionService) CheckMessageQuota(ctx context.Context, userID string) (int, error) {
+	oid, err := primitive.ObjectIDFromHex(userID)
+	if err != nil {
+		return 0, fmt.Errorf("invalid user ID")
+	}
+
+	var doc subscriptionDoc
+	err = s.db.Subscriptions().FindOne(ctx, bson.M{"user_id": oid}).Decode(&doc)
+	if err != nil {
+		return 0, fmt.Errorf("subscription not found")
+	}
+
+	if doc.Plan != types.PlanFree {
+		return -1, nil // unlimited
+	}
+
+	limit := doc.MessageLimit
+	if limit == 0 {
+		limit = FreeMessageLimit
+	}
+
+	remaining := limit - doc.MessagesUsed
+	if remaining < 0 {
+		remaining = 0
+	}
+	return remaining, nil
 }
 
 // InitiatePayment creates a payment record and returns PayU form data.

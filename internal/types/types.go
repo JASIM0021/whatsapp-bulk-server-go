@@ -145,11 +145,13 @@ type Subscription struct {
 
 // SubscriptionInfo is the public subscription data returned by APIs
 type SubscriptionInfo struct {
-	Plan       string `json:"plan"`
-	Status     string `json:"status"`
-	ExpiryDate string `json:"expiryDate"`
-	IsActive   bool   `json:"isActive"`
-	DaysLeft   int    `json:"daysLeft"`
+	Plan         string `json:"plan"`
+	Status       string `json:"status"`
+	ExpiryDate   string `json:"expiryDate"`
+	IsActive     bool   `json:"isActive"`
+	DaysLeft     int    `json:"daysLeft"`
+	MessagesUsed int    `json:"messagesUsed"`
+	MessageLimit int    `json:"messageLimit"`
 }
 
 // Payment represents a single payment record
@@ -187,6 +189,23 @@ type PayUFormData struct {
 	Udf3        string `json:"udf3"`
 	Udf4        string `json:"udf4"`
 	Udf5        string `json:"udf5"`
+}
+
+// SavedContact represents a contact stored in the user's address book
+type SavedContact struct {
+	ID        string `bson:"_id,omitempty" json:"id"`
+	UserID    string `bson:"user_id"        json:"userId"`
+	Name      string `bson:"name"           json:"name"`
+	Phone     string `bson:"phone"          json:"phone"`
+	CreatedAt string `bson:"created_at"     json:"createdAt"`
+}
+
+// SaveContactsRequest is the request body for POST /api/contacts
+type SaveContactsRequest struct {
+	Contacts []struct {
+		Name  string `json:"name"`
+		Phone string `json:"phone"`
+	} `json:"contacts"`
 }
 
 // contextKey is the type for context keys to avoid collisions

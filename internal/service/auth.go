@@ -72,7 +72,7 @@ func (s *AuthService) Register(ctx context.Context, req types.RegisterRequest) (
 	templateSvc := NewTemplateService(s.db)
 	_ = templateSvc.seedDefaultTemplates(ctx, userID)
 
-	// Create free 7-day trial subscription (non-fatal)
+	// Create free trial subscription with 50 message limit (non-fatal)
 	if s.subSvc != nil {
 		_ = s.subSvc.CreateTrialSubscription(ctx, userID)
 	}
