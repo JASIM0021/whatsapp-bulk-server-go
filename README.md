@@ -20,23 +20,27 @@ A high-performance Go backend for bulk WhatsApp messaging using the whatsmeow li
 ## Installation
 
 1. **Install dependencies**:
+
 ```bash
 cd backend-go
 go mod download
 ```
 
 2. **Configure environment**:
+
 ```bash
 cp .env.example .env
 # Edit .env if needed
 ```
 
 3. **Build and run**:
+
 ```bash
 go run cmd/server/main.go
 ```
 
 Or build a binary:
+
 ```bash
 go build -o server cmd/server/main.go
 ./server
@@ -45,6 +49,7 @@ go build -o server cmd/server/main.go
 ## API Endpoints
 
 ### Health Check
+
 ```
 GET /api/health
 ```
@@ -52,27 +57,33 @@ GET /api/health
 ### WhatsApp Operations
 
 #### Initialize WhatsApp Client
+
 ```
 POST /api/whatsapp/init
 ```
 
 #### Get QR Code (SSE Stream)
+
 ```
 GET /api/whatsapp/qr
 ```
+
 Returns a Server-Sent Events stream with QR codes and authentication status.
 
 #### Get Status
+
 ```
 GET /api/whatsapp/status
 ```
 
 #### Disconnect
+
 ```
 POST /api/whatsapp/disconnect
 ```
 
 #### Send Bulk Messages (SSE Stream)
+
 ```
 POST /api/whatsapp/send
 Content-Type: application/json
@@ -88,11 +99,13 @@ Content-Type: application/json
   }
 }
 ```
+
 Returns a Server-Sent Events stream with progress updates.
 
 ### File Upload
 
 #### Upload Excel/CSV File
+
 ```
 POST /api/upload
 Content-Type: multipart/form-data
@@ -143,6 +156,7 @@ backend-go/
 ## Development
 
 Run in development mode with auto-reload:
+
 ```bash
 # Install air for hot reload
 go install github.com/air-verse/air@latest
@@ -154,11 +168,13 @@ air
 ## Production Deployment
 
 1. Build optimized binary:
+
 ```bash
 CGO_ENABLED=1 go build -ldflags="-s -w" -o server cmd/server/main.go
 ```
 
 2. Run:
+
 ```bash
 ./server
 ```
@@ -194,7 +210,7 @@ go test -race ./...
 
 - Adjust RATE_LIMIT_MIN_DELAY and RATE_LIMIT_MAX_DELAY
 - Default is 3-5 seconds between messages
-- Recommended: Don't send more than 50 messages/hour
+- Recommended: Don't send more than 5 messages/hour
 
 ## License
 

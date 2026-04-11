@@ -65,7 +65,7 @@ func (s *EmailService) SendWelcomeEmail(toEmail, userName string) error {
               </td></tr>
             </table>
             <p style="margin:0;color:#71717a;font-size:14px;line-height:1.5;">
-              Your free trial includes 50 messages. Upgrade anytime for unlimited messaging.
+              Your free trial includes 5 messages. Upgrade anytime for unlimited messaging.
             </p>
           </td>
         </tr>

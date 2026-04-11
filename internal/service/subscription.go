@@ -33,7 +33,7 @@ var planDuration = map[string]time.Duration{
 }
 
 // Free trial message limit
-const FreeMessageLimit = 50
+const FreeMessageLimit = 5
 
 type subscriptionDoc struct {
 	ID           primitive.ObjectID `bson:"_id,omitempty"`
@@ -105,7 +105,7 @@ func (s *SubscriptionService) CreateTrialSubscription(ctx context.Context, userI
 	}
 
 	now := time.Now()
-	// Free trial: no time expiry, limited by message count (50 messages)
+	// Free trial: no time expiry, limited by message count (5 messages)
 	doc := subscriptionDoc{
 		ID:           primitive.NewObjectID(),
 		UserID:       oid,
