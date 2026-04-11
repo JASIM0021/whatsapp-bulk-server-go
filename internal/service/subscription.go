@@ -21,8 +21,8 @@ import (
 
 // Plan pricing in INR
 var planPricing = map[string]float64{
-	"monthly": 1.00,
-	"yearly":  5.00,
+	"monthly": 500,
+	"yearly":  5000,
 }
 
 // Plan durations
