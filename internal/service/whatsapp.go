@@ -218,54 +218,98 @@ func (s *WhatsAppService) Initialize() error {
 	s.client.AddEventHandler(s.handleEvents)
 
 	if hasSession {
-		// Existing session — just connect, no QR needed
+		// Existing session — try to reconnect
 		logger.Info("Reconnecting with existing session...")
 		if err := s.client.Connect(); err != nil {
-			logger.Error("Failed to connect to WhatsApp: %v", err)
-			return fmt.Errorf("failed to connect: %w", err)
+			logger.Error("Failed to connect with existing session: %v", err)
+			// Session is stale — delete it and fall through to QR generation
+			logger.Info("Deleting stale session and generating new QR code...")
+			s.client.Disconnect()
+			if deviceStore.ID != nil {
+				_ = deviceStore.Delete(context.Background())
+			}
+			s.client = nil
+			s.isReady = false
+			return s.initWithQRCodeLocked()
 		}
 
-		time.Sleep(3 * time.Second)
-		if s.isReady {
+		// Wait up to 5 seconds for the connection to become ready
+		s.mu.Unlock()
+		readyTimeout := time.After(5 * time.Second)
+		connected := false
+		select {
+		case <-s.readyChan:
+			connected = true
+		case <-readyTimeout:
+		}
+		s.mu.Lock()
+
+		if connected && s.isReady {
 			logger.Success("Reconnected with existing session!")
+			// Re-send ready signal for any listeners
 			select {
 			case s.readyChan <- true:
 			default:
 			}
 		} else {
-			logger.Warn("Existing session could not reconnect — may need to re-login")
+			// Session could not reconnect — delete stale session and generate QR
+			logger.Warn("Existing session could not reconnect — clearing and generating QR code")
+			s.client.Disconnect()
+			if deviceStore.ID != nil {
+				_ = deviceStore.Delete(context.Background())
+			}
+			s.client = nil
+			s.isReady = false
+			s.lastQR = ""
+			return s.initWithQRCodeLocked()
 		}
 	} else {
-		// No session — get QR channel for new login
-		logger.Info("No existing session — generating QR code for new login")
-		qrChan, err := s.client.GetQRChannel(context.Background())
-		if err != nil {
-			logger.Error("Failed to get QR channel: %v", err)
-			return fmt.Errorf("failed to get QR channel: %w", err)
-		}
+		return s.initWithQRCodeLocked()
+	}
 
-		go func() {
-			for evt := range qrChan {
-				if evt.Event == "code" {
-					logger.Info("New QR code generated")
-					qrCode, err := s.generateQRDataURL(evt.Code)
-					if err == nil {
-						s.mu.Lock()
-						s.lastQR = qrCode
-						s.mu.Unlock()
-						select {
-						case s.qrChan <- qrCode:
-						default:
-						}
+	return nil
+}
+
+// initWithQRCodeLocked creates a fresh client and starts QR code generation.
+// Must be called with s.mu held.
+func (s *WhatsAppService) initWithQRCodeLocked() error {
+	deviceStore, err := s.container.GetFirstDevice(context.Background())
+	if err != nil {
+		return fmt.Errorf("failed to get device: %w", err)
+	}
+
+	clientLog := waLog.Stdout("WhatsApp", "ERROR", true)
+	s.client = whatsmeow.NewClient(deviceStore, clientLog)
+	s.client.AddEventHandler(s.handleEvents)
+
+	logger.Info("Generating QR code for new login")
+	qrChan, err := s.client.GetQRChannel(context.Background())
+	if err != nil {
+		logger.Error("Failed to get QR channel: %v", err)
+		return fmt.Errorf("failed to get QR channel: %w", err)
+	}
+
+	go func() {
+		for evt := range qrChan {
+			if evt.Event == "code" {
+				logger.Info("New QR code generated")
+				qrCode, err := s.generateQRDataURL(evt.Code)
+				if err == nil {
+					s.mu.Lock()
+					s.lastQR = qrCode
+					s.mu.Unlock()
+					select {
+					case s.qrChan <- qrCode:
+					default:
 					}
 				}
 			}
-		}()
-
-		if err := s.client.Connect(); err != nil {
-			logger.Error("Failed to connect to WhatsApp: %v", err)
-			return fmt.Errorf("failed to connect: %w", err)
 		}
+	}()
+
+	if err := s.client.Connect(); err != nil {
+		logger.Error("Failed to connect to WhatsApp: %v", err)
+		return fmt.Errorf("failed to connect: %w", err)
 	}
 
 	return nil
@@ -276,12 +320,33 @@ func (s *WhatsAppService) handleEvents(evt interface{}) {
 	case *events.LoggedOut:
 		s.mu.Lock()
 		s.isReady = false
+		s.lastQR = ""
+		client := s.client
 		s.mu.Unlock()
 		logger.Warn("WhatsApp logged out (reason: %v)", v.Reason)
 		select {
 		case s.disconnectChan <- "logged out":
 		default:
 		}
+
+		// Auto-reinitialize: delete stale session and generate new QR code
+		go func() {
+			time.Sleep(1 * time.Second)
+			s.mu.Lock()
+			if client != nil {
+				client.Disconnect()
+			}
+			if client != nil && client.Store != nil && client.Store.ID != nil {
+				_ = client.Store.Delete(context.Background())
+			}
+			s.client = nil
+			s.mu.Unlock()
+
+			logger.Info("Auto-reinitializing after logout — generating new QR code")
+			if err := s.Initialize(); err != nil {
+				logger.Error("Auto-reinitialize failed after logout: %v", err)
+			}
+		}()
 
 	case *events.Connected:
 		if s.client.Store.ID != nil {
@@ -304,6 +369,7 @@ func (s *WhatsAppService) handleEvents(evt interface{}) {
 
 	case *events.Disconnected:
 		s.mu.Lock()
+		wasReady := s.isReady
 		s.isReady = false
 		s.mu.Unlock()
 		logger.Warn("WhatsApp disconnected")
@@ -312,14 +378,29 @@ func (s *WhatsAppService) handleEvents(evt interface{}) {
 		default:
 		}
 
+		// If we were previously connected, try to auto-reconnect
+		if wasReady {
+			go func() {
+				time.Sleep(3 * time.Second)
+				logger.Info("Attempting auto-reconnect after disconnect...")
+				if err := s.Initialize(); err != nil {
+					logger.Error("Auto-reconnect failed: %v", err)
+				}
+			}()
+		}
+
 	case *events.StreamReplaced:
 		s.mu.Lock()
 		s.isReady = false
 		s.mu.Unlock()
+		logger.Warn("WhatsApp stream replaced")
 		select {
 		case s.disconnectChan <- "stream replaced":
 		default:
 		}
+
+	case *events.TemporaryBan:
+		logger.Warn("WhatsApp temporary ban (code: %v)", v.Code)
 	}
 }
 
@@ -330,6 +411,23 @@ func (s *WhatsAppService) generateQRDataURL(code string) (string, error) {
 	}
 	encoded := base64.StdEncoding.EncodeToString(png)
 	return fmt.Sprintf("data:image/png;base64,%s", encoded), nil
+}
+
+// Reinitialize forces a fresh QR code generation by clearing any existing session.
+func (s *WhatsAppService) Reinitialize() error {
+	s.mu.Lock()
+	if s.client != nil {
+		s.client.Disconnect()
+		if s.client.Store != nil && s.client.Store.ID != nil {
+			_ = s.client.Store.Delete(context.Background())
+		}
+		s.client = nil
+	}
+	s.isReady = false
+	s.lastQR = ""
+	s.mu.Unlock()
+
+	return s.Initialize()
 }
 
 func (s *WhatsAppService) GetQRChannel() <-chan string  { return s.qrChan }

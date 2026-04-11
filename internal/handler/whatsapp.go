@@ -191,8 +191,14 @@ func (h *WhatsAppHandler) GetQRCode(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 
 		case <-timeout:
-			logger.Warn("QR code request timed out for user %s", userID)
-			data, _ := json.Marshal(types.ProgressUpdate{Type: "error", Data: "QR code timeout"})
+			logger.Warn("QR code request timed out for user %s — reinitializing", userID)
+			// Auto-reinitialize to generate a fresh QR code instead of giving up
+			go func() {
+				if err := waService.Reinitialize(); err != nil {
+					logger.Error("Auto-reinitialize on timeout failed for user %s: %v", userID, err)
+				}
+			}()
+			data, _ := json.Marshal(types.ProgressUpdate{Type: "timeout", Data: "QR code expired, reconnecting..."})
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
 			return
