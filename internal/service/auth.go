@@ -17,8 +17,9 @@ import (
 )
 
 type AuthService struct {
-	db     *db.DB
-	subSvc *SubscriptionService
+	db       *db.DB
+	subSvc   *SubscriptionService
+	emailSvc *EmailService
 }
 
 func NewAuthService(database *db.DB) *AuthService {
@@ -30,6 +31,11 @@ func (s *AuthService) SetSubscriptionService(subSvc *SubscriptionService) {
 	s.subSvc = subSvc
 }
 
+// SetEmailService sets the email service reference.
+func (s *AuthService) SetEmailService(emailSvc *EmailService) {
+	s.emailSvc = emailSvc
+}
+
 // userDoc is the MongoDB document shape for the users collection.
 type userDoc struct {
 	ID        primitive.ObjectID `bson:"_id,omitempty"`
@@ -37,6 +43,7 @@ type userDoc struct {
 	Password  string             `bson:"password"`
 	Name      string             `bson:"name"`
 	Role      string             `bson:"role"`
+	Status    string             `bson:"status,omitempty"`
 	CreatedAt time.Time          `bson:"created_at"`
 }
 
@@ -81,6 +88,11 @@ func (s *AuthService) Register(ctx context.Context, req types.RegisterRequest) (
 		userInfo.Subscription = subInfo
 	}
 
+	// Send welcome email (non-blocking)
+	if s.emailSvc != nil {
+		go s.emailSvc.SendWelcomeEmail(req.Email, req.Name)
+	}
+
 	return &types.AuthResponse{
 		Token: token,
 		User:  userInfo,
@@ -99,6 +111,10 @@ func (s *AuthService) Login(ctx context.Context, req types.LoginRequest) (*types
 
 	if err := bcrypt.CompareHashAndPassword([]byte(doc.Password), []byte(req.Password)); err != nil {
 		return nil, fmt.Errorf("invalid email or password")
+	}
+
+	if doc.Status == "blocked" {
+		return nil, fmt.Errorf("your account has been blocked. Contact admin for support")
 	}
 
 	userID := doc.ID.Hex()

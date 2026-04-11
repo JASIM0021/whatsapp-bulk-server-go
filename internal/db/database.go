@@ -63,6 +63,7 @@ func (d *DB) EnsureIndexes(ctx context.Context) error {
 	return err
 }
 
+func (d *DB) MongoDB() *mongo.Database           { return d.mdb }
 func (d *DB) Users() *mongo.Collection         { return d.mdb.Collection("users") }
 func (d *DB) Templates() *mongo.Collection     { return d.mdb.Collection("templates") }
 func (d *DB) WASessions() *mongo.Collection    { return d.mdb.Collection("wa_sessions") }

@@ -52,7 +52,10 @@ func main() {
 	// Initialize services first (needed for seeding)
 	authService := service.NewAuthService(appDB)
 	subscriptionService := service.NewSubscriptionService(appDB)
+	emailService := service.NewEmailService()
 	authService.SetSubscriptionService(subscriptionService)
+	authService.SetEmailService(emailService)
+	subscriptionService.SetEmailService(emailService)
 	templateService := service.NewTemplateService(appDB)
 
 	// Seed default user if not exists
@@ -97,6 +100,7 @@ func main() {
 	whatsappHandler := handler.NewWhatsAppHandler("sessions", appDB)
 	uploadHandler := handler.NewUploadHandler()
 	imageHandler := handler.NewImageHandler()
+	adminHandler := handler.NewAdminHandler(appDB.MongoDB(), authService, emailService)
 
 	// Auth middleware helper
 	authMiddleware := middleware.Auth(authService)
@@ -142,6 +146,36 @@ func main() {
 	mux.Handle("/api/templates", wrapSub(templateHandler.HandleCollection))
 	mux.Handle("/api/templates/", wrapSub(templateHandler.Single))
 
+	// Admin routes (auth + admin role required)
+	adminMiddleware := middleware.AdminOnly(appDB.MongoDB())
+	wrapAdmin := func(h http.HandlerFunc) http.Handler {
+		return authMiddleware(adminMiddleware(http.HandlerFunc(h)))
+	}
+	mux.Handle("/api/admin/stats", wrapAdmin(adminHandler.GetStats))
+	mux.Handle("/api/admin/users", wrapAdmin(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			adminHandler.ListUsers(w, r)
+		case http.MethodPost:
+			adminHandler.CreateUser(w, r)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	mux.Handle("/api/admin/users/", wrapAdmin(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			adminHandler.GetUser(w, r)
+		case http.MethodPut:
+			adminHandler.UpdateUser(w, r)
+		case http.MethodDelete:
+			adminHandler.DeleteUser(w, r)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	mux.Handle("/api/admin/email/promotional", wrapAdmin(adminHandler.SendPromotionalEmail))
+
 	logger.Info("Registered API routes:")
 	logger.Info("  • GET  /api/health")
 	logger.Info("  • POST /api/auth/register")
@@ -161,6 +195,10 @@ func main() {
 	logger.Info("  • POST /api/upload/image  [protected+subscription]")
 	logger.Info("  • GET/POST /api/templates  [protected+subscription]")
 	logger.Info("  • PUT/DELETE /api/templates/{id}  [protected+subscription]")
+	logger.Info("  • GET  /api/admin/stats  [admin]")
+	logger.Info("  • GET  /api/admin/users  [admin]")
+	logger.Info("  • GET/PUT/DELETE /api/admin/users/{id}  [admin]")
+	logger.Info("  • POST /api/admin/email/promotional  [admin]")
 
 	// Apply CORS + Logging middleware
 	handlerWithMiddleware := middleware.Logging(middleware.CORS(mux))

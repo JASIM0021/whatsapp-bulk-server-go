@@ -56,6 +56,7 @@ type paymentDoc struct {
 
 type SubscriptionService struct {
 	db          *db.DB
+	emailSvc    *EmailService
 	merchantKey string
 	salt        string
 	baseURL     string
@@ -84,6 +85,11 @@ func NewSubscriptionService(database *db.DB) *SubscriptionService {
 		backendURL:  backendURL,
 		frontendURL: frontendURL,
 	}
+}
+
+// SetEmailService sets the email service reference.
+func (s *SubscriptionService) SetEmailService(emailSvc *EmailService) {
+	s.emailSvc = emailSvc
 }
 
 // CreateTrialSubscription creates a free 7-day trial for a new user.
@@ -328,6 +334,30 @@ func (s *SubscriptionService) HandlePaymentSuccess(ctx context.Context, params m
 	}
 
 	logger.Success("Subscription activated: user=%s plan=%s expires=%s", userID, plan, now.Add(duration).Format("2006-01-02"))
+
+	// Send invoice email (non-blocking)
+	if s.emailSvc != nil {
+		go func() {
+			var userDoc struct {
+				Email string `bson:"email"`
+				Name  string `bson:"name"`
+			}
+			if err := s.db.Users().FindOne(ctx, bson.M{"_id": oid}).Decode(&userDoc); err == nil {
+				amount, _ := planPricing[plan]
+				s.emailSvc.SendInvoiceEmail(InvoiceData{
+					UserName:    userDoc.Name,
+					UserEmail:   userDoc.Email,
+					Plan:        plan,
+					Amount:      fmt.Sprintf("%.2f", amount),
+					TxnID:       txnID,
+					PaymentID:   mihpayID,
+					PaymentDate: now,
+					ExpiryDate:  now.Add(duration),
+				})
+			}
+		}()
+	}
+
 	return txnID, nil
 }
 
