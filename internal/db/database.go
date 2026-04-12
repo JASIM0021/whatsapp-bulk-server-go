@@ -85,6 +85,21 @@ func (d *DB) EnsureIndexes(ctx context.Context) error {
 		Keys:    bson.D{{Key: "expires_at", Value: 1}},
 		Options: options.Index().SetExpireAfterSeconds(expireAfter),
 	})
+	if err != nil {
+		return err
+	}
+	// Password resets: one pending reset per email
+	_, err = d.PasswordResets().Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "email", Value: 1}},
+		Options: options.Index().SetUnique(true),
+	})
+	if err != nil {
+		return err
+	}
+	_, err = d.PasswordResets().Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "expires_at", Value: 1}},
+		Options: options.Index().SetExpireAfterSeconds(expireAfter),
+	})
 	return err
 }
 
@@ -95,7 +110,8 @@ func (d *DB) WASessions() *mongo.Collection    { return d.mdb.Collection("wa_ses
 func (d *DB) Subscriptions() *mongo.Collection { return d.mdb.Collection("subscriptions") }
 func (d *DB) Payments() *mongo.Collection      { return d.mdb.Collection("payments") }
 func (d *DB) Contacts() *mongo.Collection      { return d.mdb.Collection("contacts") }
-func (d *DB) EmailOTPs() *mongo.Collection     { return d.mdb.Collection("email_otps") }
+func (d *DB) EmailOTPs() *mongo.Collection       { return d.mdb.Collection("email_otps") }
+func (d *DB) PasswordResets() *mongo.Collection { return d.mdb.Collection("password_resets") }
 
 func (d *DB) Close(ctx context.Context) error {
 	return d.client.Disconnect(ctx)

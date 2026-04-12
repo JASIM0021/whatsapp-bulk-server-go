@@ -69,6 +69,47 @@ func (s *EmailService) SendOTPEmail(toEmail, userName, code string) error {
 	return s.sendMail(toEmail, subject, htmlBody)
 }
 
+// SendPasswordResetEmail sends a 5-digit reset code to the user's email.
+func (s *EmailService) SendPasswordResetEmail(toEmail, userName, code string) error {
+	subject := "Reset Your BulkSend Password — Code: " + code
+
+	htmlBody := fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background-color:#f4f4f5;font-family:'Segoe UI',Arial,sans-serif;">
+  <table width="100%%" cellpadding="0" cellspacing="0" style="background-color:#f4f4f5;padding:40px 0;">
+    <tr><td align="center">
+      <table width="560" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+        <tr>
+          <td style="background-color:#dc2626;padding:28px 40px;text-align:center;">
+            <h1 style="margin:0;color:#ffffff;font-size:24px;font-weight:700;">WhatsApp Bulk Sender</h1>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:40px;text-align:center;">
+            <h2 style="margin:0 0 8px;color:#18181b;font-size:20px;">Password Reset Request</h2>
+            <p style="margin:0 0 32px;color:#71717a;font-size:15px;">Hi %s, use the code below to reset your password.</p>
+            <div style="display:inline-block;background-color:#fef2f2;border:2px dashed #dc2626;border-radius:12px;padding:24px 48px;margin-bottom:32px;">
+              <span style="font-size:42px;font-weight:800;letter-spacing:12px;color:#b91c1c;font-family:monospace;">%s</span>
+            </div>
+            <p style="margin:0 0 8px;color:#71717a;font-size:13px;">This code expires in <strong>10 minutes</strong>.</p>
+            <p style="margin:0;color:#a1a1aa;font-size:12px;">If you did not request a password reset, you can safely ignore this email. Your password will not change.</p>
+          </td>
+        </tr>
+        <tr>
+          <td style="background-color:#fafafa;padding:20px 40px;border-top:1px solid #e4e4e7;text-align:center;">
+            <p style="margin:0;color:#a1a1aa;font-size:12px;">WhatsApp Bulk Sender &mdash; Account Security</p>
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`, userName, code)
+
+	return s.sendMail(toEmail, subject, htmlBody)
+}
+
 // SendWelcomeEmail sends a branded HTML welcome email after user registration.
 func (s *EmailService) SendWelcomeEmail(toEmail, userName string) error {
 	subject := "Welcome to WhatsApp Bulk Sender — Your Free Trial Starts Now!"
@@ -91,7 +132,7 @@ func (s *EmailService) SendWelcomeEmail(toEmail, userName string) error {
           <td style="padding:40px;">
             <h2 style="margin:0 0 16px;color:#18181b;font-size:22px;">Welcome aboard, %s!</h2>
             <p style="margin:0 0 16px;color:#3f3f46;font-size:16px;line-height:1.6;">
-              We're excited to have you. Your account is now active with a <strong>free trial of 50 bulk messages</strong> that gives you full access to every feature.
+              We're excited to have you. Your account is now active with a <strong>free trial of 5 bulk messages</strong> that gives you full access to every feature.
             </p>
             <p style="margin:0 0 8px;color:#3f3f46;font-size:16px;line-height:1.6;">Here's what you can do right away:</p>
             <ul style="margin:0 0 24px;padding-left:20px;color:#3f3f46;font-size:15px;line-height:1.8;">

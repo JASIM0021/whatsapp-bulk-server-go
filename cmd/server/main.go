@@ -127,6 +127,8 @@ func main() {
 	mux.HandleFunc("/api/auth/register", authHandler.Register)
 	mux.HandleFunc("/api/auth/send-otp", authHandler.SendOTP)
 	mux.HandleFunc("/api/auth/verify-otp", authHandler.VerifyOTP)
+	mux.HandleFunc("/api/auth/forgot-password", authHandler.ForgotPassword)
+	mux.HandleFunc("/api/auth/reset-password", authHandler.ResetPassword)
 	mux.HandleFunc("/api/auth/login", authHandler.Login)
 
 	// PayU callback routes (PUBLIC — no JWT, security via hash verification)

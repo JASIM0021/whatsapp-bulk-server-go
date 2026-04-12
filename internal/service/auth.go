@@ -39,6 +39,15 @@ func (s *AuthService) SetEmailService(emailSvc *EmailService) {
 	s.emailSvc = emailSvc
 }
 
+// resetDoc stores a pending password-reset OTP.
+type resetDoc struct {
+	ID        primitive.ObjectID `bson:"_id,omitempty"`
+	Email     string             `bson:"email"`
+	Code      string             `bson:"code"`
+	ExpiresAt time.Time          `bson:"expires_at"`
+	CreatedAt time.Time          `bson:"created_at"`
+}
+
 // otpDoc stores a pending registration with a one-time verification code.
 type otpDoc struct {
 	ID             primitive.ObjectID `bson:"_id,omitempty"`
@@ -325,6 +334,92 @@ func (s *AuthService) VerifyOTPAndRegister(ctx context.Context, req types.Verify
 	}
 
 	return &types.AuthResponse{Token: token, User: userInfo}, nil
+}
+
+// SendPasswordResetOTP generates a 5-digit OTP and emails it to the user.
+// If the email doesn't exist we return success anyway (don't leak whether email is registered).
+func (s *AuthService) SendPasswordResetOTP(ctx context.Context, req types.ForgotPasswordRequest) error {
+	email := strings.TrimSpace(strings.ToLower(req.Email))
+	if email == "" {
+		return fmt.Errorf("email is required")
+	}
+
+	// Verify the email is actually registered
+	var u userDoc
+	err := s.db.Users().FindOne(ctx, bson.M{"email": email}).Decode(&u)
+	if err == mongo.ErrNoDocuments {
+		// Return nil so we don't expose whether the email exists
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("database error")
+	}
+
+	code := fmt.Sprintf("%05d", rand.Intn(100000))
+	now := time.Now()
+
+	doc := resetDoc{
+		ID:        primitive.NewObjectID(),
+		Email:     email,
+		Code:      code,
+		ExpiresAt: now.Add(10 * time.Minute),
+		CreatedAt: now,
+	}
+
+	opts := options.Replace().SetUpsert(true)
+	if _, err := s.db.PasswordResets().ReplaceOne(ctx, bson.M{"email": email}, doc, opts); err != nil {
+		return fmt.Errorf("failed to store reset code")
+	}
+
+	if s.emailSvc != nil {
+		if err := s.emailSvc.SendPasswordResetEmail(email, u.Name, code); err != nil {
+			return fmt.Errorf("failed to send reset email: %w", err)
+		}
+	}
+	return nil
+}
+
+// ResetPassword verifies the OTP and updates the user's password.
+func (s *AuthService) ResetPassword(ctx context.Context, req types.ResetPasswordRequest) error {
+	email := strings.TrimSpace(strings.ToLower(req.Email))
+	code := strings.TrimSpace(req.Code)
+
+	if len(req.NewPassword) < 6 {
+		return fmt.Errorf("password must be at least 6 characters")
+	}
+
+	var doc resetDoc
+	err := s.db.PasswordResets().FindOne(ctx, bson.M{"email": email}).Decode(&doc)
+	if err == mongo.ErrNoDocuments {
+		return fmt.Errorf("no password reset request found. Please request a new code")
+	}
+	if err != nil {
+		return fmt.Errorf("verification failed")
+	}
+	if time.Now().After(doc.ExpiresAt) {
+		s.db.PasswordResets().DeleteOne(ctx, bson.M{"email": email})
+		return fmt.Errorf("reset code has expired. Please request a new one")
+	}
+	if doc.Code != code {
+		return fmt.Errorf("incorrect reset code")
+	}
+
+	// Delete used OTP
+	s.db.PasswordResets().DeleteOne(ctx, bson.M{"email": email})
+
+	// Hash new password and update user
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), 12)
+	if err != nil {
+		return fmt.Errorf("failed to process password")
+	}
+	_, err = s.db.Users().UpdateOne(ctx,
+		bson.M{"email": email},
+		bson.M{"$set": bson.M{"password": string(hash)}},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update password")
+	}
+	return nil
 }
 
 func jwtSecret() string {

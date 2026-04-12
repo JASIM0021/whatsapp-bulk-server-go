@@ -208,6 +208,18 @@ type SaveContactsRequest struct {
 	} `json:"contacts"`
 }
 
+// ForgotPasswordRequest is the request body for POST /api/auth/forgot-password
+type ForgotPasswordRequest struct {
+	Email string `json:"email"`
+}
+
+// ResetPasswordRequest is the request body for POST /api/auth/reset-password
+type ResetPasswordRequest struct {
+	Email       string `json:"email"`
+	Code        string `json:"code"`
+	NewPassword string `json:"newPassword"`
+}
+
 // SendOTPRequest is the request body for POST /api/auth/send-otp
 type SendOTPRequest struct {
 	Email    string `json:"email"`
