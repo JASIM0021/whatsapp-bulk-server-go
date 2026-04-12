@@ -41,13 +41,22 @@ func (h *WhatsAppHandler) SetSubscriptionService(subSvc *service.SubscriptionSer
 	h.subService = subSvc
 }
 
-// Shutdown disconnects all active WhatsApp sessions.
+// Shutdown gracefully closes all active WhatsApp WebSocket connections.
+// Sessions are preserved in SQLite so users reconnect automatically on restart.
 func (h *WhatsAppHandler) Shutdown() {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	for _, svc := range h.services {
-		svc.Disconnect()
+		svc.GracefulShutdown()
 	}
+}
+
+// GetServiceForUser returns the WhatsAppService for a given userID if it exists (read-only, no auto-init).
+func (h *WhatsAppHandler) GetServiceForUser(userID string) (*service.WhatsAppService, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	svc, ok := h.services[userID]
+	return svc, ok
 }
 
 func (h *WhatsAppHandler) getOrCreateService(userID string) (*service.WhatsAppService, error) {
@@ -71,6 +80,17 @@ func (h *WhatsAppHandler) getOrCreateService(userID string) (*service.WhatsAppSe
 		return nil, err
 	}
 	h.services[userID] = svc
+
+	// If a session was restored from MongoDB, auto-reconnect in the background
+	// so users don't need to manually re-init after a server restart / PM2 reload.
+	if svc.HasRestoredSession() {
+		go func() {
+			if err := svc.Initialize(); err != nil {
+				logger.Info("Auto-reconnect failed for user %s: %v (user may need to re-scan QR)", userID, err)
+			}
+		}()
+	}
+
 	return svc, nil
 }
 

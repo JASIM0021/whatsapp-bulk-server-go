@@ -142,6 +142,20 @@ func (d *DB) EnsureIndexes(ctx context.Context) error {
 	_, err = d.PromoCodes().Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys: bson.D{{Key: "is_active", Value: 1}},
 	})
+	if err != nil {
+		return err
+	}
+	// API keys: key must be globally unique
+	_, err = d.APIKeys().Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "key", Value: 1}},
+		Options: options.Index().SetUnique(true),
+	})
+	if err != nil {
+		return err
+	}
+	_, err = d.APIKeys().Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys: bson.D{{Key: "user_id", Value: 1}},
+	})
 	return err
 }
 
@@ -157,6 +171,7 @@ func (d *DB) PasswordResets() *mongo.Collection { return d.mdb.Collection("passw
 func (d *DB) Invoices() *mongo.Collection      { return d.mdb.Collection("invoices") }
 func (d *DB) PlanConfigs() *mongo.Collection   { return d.mdb.Collection("plan_configs") }
 func (d *DB) PromoCodes() *mongo.Collection    { return d.mdb.Collection("promo_codes") }
+func (d *DB) APIKeys() *mongo.Collection       { return d.mdb.Collection("api_keys") }
 
 func (d *DB) Close(ctx context.Context) error {
 	return d.client.Disconnect(ctx)

@@ -104,6 +104,9 @@ func main() {
 	imageHandler := handler.NewImageHandler()
 	adminHandler := handler.NewAdminHandler(appDB.MongoDB(), authService, emailService, subscriptionService)
 	contactsHandler := handler.NewContactsHandler(appDB)
+	apiKeyService := service.NewAPIKeyService(appDB, subscriptionService)
+	apiKeyHandler := handler.NewAPIKeyHandler(apiKeyService)
+	externalHandler := handler.NewExternalAPIHandler(whatsappHandler)
 
 	// Auth middleware helper
 	authMiddleware := middleware.Auth(authService)
@@ -114,6 +117,11 @@ func main() {
 	// wrapSub applies auth + subscription check
 	wrapSub := func(h http.HandlerFunc) http.Handler {
 		return authMiddleware(subMiddleware(http.HandlerFunc(h)))
+	}
+	// wrapAPIKey applies API-key auth (no JWT)
+	apiKeyMiddleware := middleware.APIKeyAuth(apiKeyService, subscriptionService)
+	wrapAPIKey := func(h http.HandlerFunc) http.Handler {
+		return apiKeyMiddleware(http.HandlerFunc(h))
 	}
 
 	// Create HTTP mux
@@ -160,6 +168,28 @@ func main() {
 	// Contacts book (auth only — no subscription gate)
 	mux.Handle("/api/contacts", wrap(contactsHandler.HandleCollection))
 	mux.Handle("/api/contacts/", wrap(contactsHandler.HandleSingle))
+
+	// API key management (JWT auth — no subscription gate so users can view/revoke after expiry)
+	mux.Handle("/api/apikeys", wrap(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			apiKeyHandler.ListKeys(w, r)
+		case http.MethodPost:
+			apiKeyHandler.CreateKey(w, r)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	mux.Handle("/api/apikeys/", wrap(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			apiKeyHandler.RevokeKey(w, r)
+		} else {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+
+	// External developer API (API-key auth, not JWT)
+	mux.Handle("/api/v1/send", wrapAPIKey(externalHandler.Send))
 
 	// Admin routes (auth + admin role required)
 	adminMiddleware := middleware.AdminOnly(appDB.MongoDB())

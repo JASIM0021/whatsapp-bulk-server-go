@@ -50,10 +50,11 @@ type WhatsAppService struct {
 	lastQR         string
 
 	// session persistence
-	db      *db.DB
-	userID  string
-	dbPath  string // path to the temp SQLite file
-	stopSync chan struct{}
+	db                  *db.DB
+	userID              string
+	dbPath              string // path to the temp SQLite file
+	stopSync            chan struct{}
+	hadRestoredSession  bool // true when a session was loaded from MongoDB on startup
 }
 
 func NewWhatsAppService() (*WhatsAppService, error) {
@@ -111,7 +112,11 @@ func (s *WhatsAppService) restoreFromMongo(ctx context.Context) error {
 		return err
 	}
 	logger.Info("Restoring WhatsApp session from MongoDB for user %s", s.userID)
-	return os.WriteFile(s.dbPath, doc.SessionData, 0600)
+	if err := os.WriteFile(s.dbPath, doc.SessionData, 0600); err != nil {
+		return err
+	}
+	s.hadRestoredSession = true
+	return nil
 }
 
 // syncToMongo reads the current SQLite file and saves it to MongoDB.
@@ -430,6 +435,9 @@ func (s *WhatsAppService) Reinitialize() error {
 	return s.Initialize()
 }
 
+// HasRestoredSession returns true when the session was loaded from MongoDB on startup.
+func (s *WhatsAppService) HasRestoredSession() bool { return s.hadRestoredSession }
+
 func (s *WhatsAppService) GetQRChannel() <-chan string  { return s.qrChan }
 func (s *WhatsAppService) GetReadyChannel() <-chan bool { return s.readyChan }
 func (s *WhatsAppService) GetDisconnectChannel() <-chan string { return s.disconnectChan }
@@ -529,6 +537,27 @@ func (s *WhatsAppService) parseAndNormalizePhone(phone string) (types.JID, strin
 		Server: types.DefaultUserServer,
 	}
 	return jid, normalizedPhone, nil
+}
+
+// GracefulShutdown closes the WebSocket connection without logging out.
+// Sessions remain valid in SQLite so the client can reconnect on next startup
+// without requiring a new QR scan. Use this for server restarts / PM2 reloads.
+func (s *WhatsAppService) GracefulShutdown() {
+	// Stop periodic sync
+	select {
+	case s.stopSync <- struct{}{}:
+	default:
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.client != nil {
+		logger.Info("Graceful shutdown: closing WebSocket for user %s (session preserved)", s.userID)
+		s.client.Disconnect() // close WS only — no Logout(), no SQLite/MongoDB delete
+		s.isReady = false
+		s.lastQR = ""
+	}
 }
 
 func (s *WhatsAppService) Disconnect() {

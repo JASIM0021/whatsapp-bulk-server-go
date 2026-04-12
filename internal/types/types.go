@@ -325,3 +325,41 @@ type contextKey string
 
 // UserIDKey is the context key for the authenticated user's ID (string ObjectID hex)
 const UserIDKey contextKey = "userID"
+
+// APIKey represents a developer API key (returned to the frontend)
+type APIKey struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Key        string `json:"key,omitempty"`  // only shown on creation
+	KeyPreview string `json:"keyPreview"`     // e.g. "bsk_a1b2...ef12"
+	IsActive   bool   `json:"isActive"`
+	LastUsedAt string `json:"lastUsedAt,omitempty"`
+	CreatedAt  string `json:"createdAt"`
+}
+
+// CreateAPIKeyRequest is the request body for generating a new API key
+type CreateAPIKeyRequest struct {
+	Name string `json:"name"` // optional label
+}
+
+// ExternalSendRequest is the request body for the developer API POST /api/v1/send
+type ExternalSendRequest struct {
+	Phone    string `json:"phone,omitempty"`
+	Contacts []struct {
+		Phone string `json:"phone"`
+		Name  string `json:"name,omitempty"`
+	} `json:"contacts,omitempty"`
+	Message struct {
+		Text     string `json:"text"`
+		ImageURL string `json:"imageUrl,omitempty"`
+	} `json:"message"`
+}
+
+// ExternalSendResponse is the JSON response from POST /api/v1/send
+type ExternalSendResponse struct {
+	Success bool     `json:"success"`
+	Sent    int      `json:"sent"`
+	Failed  int      `json:"failed"`
+	Total   int      `json:"total"`
+	Errors  []string `json:"errors,omitempty"`
+}
