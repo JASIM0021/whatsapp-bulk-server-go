@@ -49,10 +49,10 @@ func (h *APIKeyHandler) CreateKey(w http.ResponseWriter, r *http.Request) {
 
 	key, err := h.apiKeySvc.GenerateAPIKey(r.Context(), userID, req.Name)
 	if err != nil {
-		if err.Error() == "api_access_requires_pro_subscription" {
+		if err.Error() == "api_access_requires_active_subscription" {
 			writeJSON(w, http.StatusForbidden, map[string]interface{}{
 				"success": false,
-				"error":   "API access requires an active Pro subscription (Monthly or Yearly).",
+				"error":   "API access requires an active subscription.",
 			})
 			return
 		}

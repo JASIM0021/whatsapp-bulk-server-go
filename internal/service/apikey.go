@@ -34,18 +34,14 @@ func NewAPIKeyService(database *appdb.DB, sub *SubscriptionService) *APIKeyServi
 }
 
 // GenerateAPIKey creates a new API key for the given user.
-// Returns an error if the user is not on an active pro plan.
+// Requires an active subscription (any plan including free).
 func (s *APIKeyService) GenerateAPIKey(ctx context.Context, userID, name string) (*types.APIKey, error) {
 	active, err := s.sub.IsSubscriptionActive(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
-	sub, serr := s.sub.GetSubscription(ctx, userID)
-	if serr != nil {
-		return nil, serr
-	}
-	if !active || sub.Plan == types.PlanFree {
-		return nil, errors.New("api_access_requires_pro_subscription")
+	if !active {
+		return nil, errors.New("api_access_requires_active_subscription")
 	}
 
 	// Generate key: "bsk_" + 32 hex chars (16 random bytes)
