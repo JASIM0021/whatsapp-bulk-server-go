@@ -59,6 +59,45 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, types.APIResponse{Success: true, Data: resp})
 }
 
+// SendOTP handles POST /api/auth/send-otp — generates and emails a 5-digit code.
+func (h *AuthHandler) SendOTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req types.SendOTPRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	if err := h.authService.SendRegistrationOTP(r.Context(), req); err != nil {
+		respondError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	respondJSON(w, types.APIResponse{Success: true, Message: "Verification code sent to your email"})
+}
+
+// VerifyOTP handles POST /api/auth/verify-otp — verifies the code and creates the account.
+func (h *AuthHandler) VerifyOTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req types.VerifyOTPRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	resp, err := h.authService.VerifyOTPAndRegister(r.Context(), req)
+	if err != nil {
+		respondError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(types.APIResponse{Success: true, Data: resp})
+}
+
 func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		respondError(w, "Method not allowed", http.StatusMethodNotAllowed)

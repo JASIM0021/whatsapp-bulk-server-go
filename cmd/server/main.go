@@ -125,6 +125,8 @@ func main() {
 		w.Write([]byte(`{"success":true,"message":"Server is running"}`))
 	})
 	mux.HandleFunc("/api/auth/register", authHandler.Register)
+	mux.HandleFunc("/api/auth/send-otp", authHandler.SendOTP)
+	mux.HandleFunc("/api/auth/verify-otp", authHandler.VerifyOTP)
 	mux.HandleFunc("/api/auth/login", authHandler.Login)
 
 	// PayU callback routes (PUBLIC — no JWT, security via hash verification)

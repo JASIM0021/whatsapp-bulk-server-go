@@ -3,13 +3,16 @@ package service
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/JASIM0021/bulk-whatsapp-send/backend/internal/db"
@@ -34,6 +37,17 @@ func (s *AuthService) SetSubscriptionService(subSvc *SubscriptionService) {
 // SetEmailService sets the email service reference.
 func (s *AuthService) SetEmailService(emailSvc *EmailService) {
 	s.emailSvc = emailSvc
+}
+
+// otpDoc stores a pending registration with a one-time verification code.
+type otpDoc struct {
+	ID             primitive.ObjectID `bson:"_id,omitempty"`
+	Email          string             `bson:"email"`
+	Name           string             `bson:"name"`
+	HashedPassword string             `bson:"hashed_password"`
+	Code           string             `bson:"code"`
+	ExpiresAt      time.Time          `bson:"expires_at"`
+	CreatedAt      time.Time          `bson:"created_at"`
 }
 
 // userDoc is the MongoDB document shape for the users collection.
@@ -194,6 +208,123 @@ func (s *AuthService) ValidateToken(tokenStr string) (string, error) {
 		return "", fmt.Errorf("invalid token claims")
 	}
 	return sub, nil
+}
+
+// SendRegistrationOTP generates a 5-digit OTP, stores the pending registration,
+// and emails the code. Existing pending OTP for that email is replaced.
+func (s *AuthService) SendRegistrationOTP(ctx context.Context, req types.SendOTPRequest) error {
+	email := strings.TrimSpace(strings.ToLower(req.Email))
+	if email == "" || req.Password == "" || req.Name == "" {
+		return fmt.Errorf("email, name and password are required")
+	}
+
+	// Check if email already registered
+	var existing userDoc
+	err := s.db.Users().FindOne(ctx, bson.M{"email": email}).Decode(&existing)
+	if err == nil {
+		return fmt.Errorf("email already registered")
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), 12)
+	if err != nil {
+		return fmt.Errorf("failed to process password")
+	}
+
+	// 5-digit OTP
+	code := fmt.Sprintf("%05d", rand.Intn(100000))
+	now := time.Now()
+
+	doc := otpDoc{
+		ID:             primitive.NewObjectID(),
+		Email:          email,
+		Name:           strings.TrimSpace(req.Name),
+		HashedPassword: string(hash),
+		Code:           code,
+		ExpiresAt:      now.Add(10 * time.Minute),
+		CreatedAt:      now,
+	}
+
+	// Upsert: replace existing OTP for this email (handles resend)
+	opts := options.Replace().SetUpsert(true)
+	_, err = s.db.EmailOTPs().ReplaceOne(ctx, bson.M{"email": email}, doc, opts)
+	if err != nil {
+		return fmt.Errorf("failed to store OTP")
+	}
+
+	// Send email (blocking so caller knows if it failed)
+	if s.emailSvc != nil {
+		if err := s.emailSvc.SendOTPEmail(email, req.Name, code); err != nil {
+			return fmt.Errorf("failed to send verification email: %w", err)
+		}
+	}
+	return nil
+}
+
+// VerifyOTPAndRegister checks the OTP and, if valid, creates the user account.
+func (s *AuthService) VerifyOTPAndRegister(ctx context.Context, req types.VerifyOTPRequest) (*types.AuthResponse, error) {
+	email := strings.TrimSpace(strings.ToLower(req.Email))
+	code := strings.TrimSpace(req.Code)
+
+	var doc otpDoc
+	err := s.db.EmailOTPs().FindOne(ctx, bson.M{"email": email}).Decode(&doc)
+	if err == mongo.ErrNoDocuments {
+		return nil, fmt.Errorf("no pending verification found for this email")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("verification failed")
+	}
+	if time.Now().After(doc.ExpiresAt) {
+		s.db.EmailOTPs().DeleteOne(ctx, bson.M{"email": email})
+		return nil, fmt.Errorf("verification code has expired. Please request a new one")
+	}
+	if doc.Code != code {
+		return nil, fmt.Errorf("incorrect verification code")
+	}
+
+	// OTP valid — delete it and create the user
+	s.db.EmailOTPs().DeleteOne(ctx, bson.M{"email": email})
+
+	userID := primitive.NewObjectID()
+	userDoc := userDoc{
+		ID:        userID,
+		Email:     email,
+		Password:  doc.HashedPassword,
+		Name:      doc.Name,
+		Role:      "user",
+		CreatedAt: time.Now(),
+	}
+	if _, err := s.db.Users().InsertOne(ctx, userDoc); err != nil {
+		return nil, fmt.Errorf("email already registered")
+	}
+
+	userIDHex := userID.Hex()
+
+	// Seed templates (non-fatal)
+	templateSvc := NewTemplateService(s.db)
+	_ = templateSvc.seedDefaultTemplates(ctx, userIDHex)
+
+	// Create trial subscription (non-fatal)
+	if s.subSvc != nil {
+		_ = s.subSvc.CreateTrialSubscription(ctx, userIDHex)
+	}
+
+	token, err := s.GenerateToken(userIDHex, email, "user")
+	if err != nil {
+		return nil, err
+	}
+
+	userInfo := types.UserInfo{ID: userIDHex, Email: email, Name: doc.Name, Role: "user"}
+	if s.subSvc != nil {
+		subInfo, _ := s.subSvc.GetSubscription(ctx, userIDHex)
+		userInfo.Subscription = subInfo
+	}
+
+	// Send welcome email (non-blocking)
+	if s.emailSvc != nil {
+		go s.emailSvc.SendWelcomeEmail(email, doc.Name)
+	}
+
+	return &types.AuthResponse{Token: token, User: userInfo}, nil
 }
 
 func jwtSecret() string {

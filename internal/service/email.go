@@ -28,6 +28,47 @@ func NewEmailService() *EmailService {
 	}
 }
 
+// SendOTPEmail sends a 5-digit verification code email for registration.
+func (s *EmailService) SendOTPEmail(toEmail, userName, code string) error {
+	subject := "Your BulkSend Verification Code: " + code
+
+	htmlBody := fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background-color:#f4f4f5;font-family:'Segoe UI',Arial,sans-serif;">
+  <table width="100%%" cellpadding="0" cellspacing="0" style="background-color:#f4f4f5;padding:40px 0;">
+    <tr><td align="center">
+      <table width="560" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+        <tr>
+          <td style="background-color:#16a34a;padding:28px 40px;text-align:center;">
+            <h1 style="margin:0;color:#ffffff;font-size:24px;font-weight:700;">WhatsApp Bulk Sender</h1>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:40px;text-align:center;">
+            <h2 style="margin:0 0 8px;color:#18181b;font-size:20px;">Verify your email address</h2>
+            <p style="margin:0 0 32px;color:#71717a;font-size:15px;">Hi %s, use the code below to complete your registration.</p>
+            <div style="display:inline-block;background-color:#f0fdf4;border:2px dashed #16a34a;border-radius:12px;padding:24px 48px;margin-bottom:32px;">
+              <span style="font-size:42px;font-weight:800;letter-spacing:12px;color:#15803d;font-family:monospace;">%s</span>
+            </div>
+            <p style="margin:0 0 8px;color:#71717a;font-size:13px;">This code expires in <strong>10 minutes</strong>.</p>
+            <p style="margin:0;color:#a1a1aa;font-size:12px;">If you did not request this, you can safely ignore this email.</p>
+          </td>
+        </tr>
+        <tr>
+          <td style="background-color:#fafafa;padding:20px 40px;border-top:1px solid #e4e4e7;text-align:center;">
+            <p style="margin:0;color:#a1a1aa;font-size:12px;">WhatsApp Bulk Sender &mdash; Secure Email Verification</p>
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`, userName, code)
+
+	return s.sendMail(toEmail, subject, htmlBody)
+}
+
 // SendWelcomeEmail sends a branded HTML welcome email after user registration.
 func (s *EmailService) SendWelcomeEmail(toEmail, userName string) error {
 	subject := "Welcome to WhatsApp Bulk Sender — Your Free Trial Starts Now!"

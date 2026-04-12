@@ -22,7 +22,8 @@ module.exports = {
       env_production: {
         PORT: 4000,
         NODE_ENV: 'production',
-        FRONTEND_URL: 'https://your-frontend-domain.com',
+        BACKEND_URL: 'https://bulksenderapi.todayintech.in',
+        FRONTEND_URL: 'https://bulksender.todayintech.in',
         WHATSAPP_SESSION_PATH: '/var/lib/whatsapp/session.db',
         UPLOAD_DIR: '/var/lib/whatsapp/uploads',
         MAX_FILE_SIZE: 10485760,

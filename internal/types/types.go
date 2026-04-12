@@ -208,6 +208,19 @@ type SaveContactsRequest struct {
 	} `json:"contacts"`
 }
 
+// SendOTPRequest is the request body for POST /api/auth/send-otp
+type SendOTPRequest struct {
+	Email    string `json:"email"`
+	Name     string `json:"name"`
+	Password string `json:"password"`
+}
+
+// VerifyOTPRequest is the request body for POST /api/auth/verify-otp
+type VerifyOTPRequest struct {
+	Email string `json:"email"`
+	Code  string `json:"code"`
+}
+
 // contextKey is the type for context keys to avoid collisions
 type contextKey string
 
