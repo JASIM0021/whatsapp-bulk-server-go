@@ -144,6 +144,7 @@ func main() {
 	mux.Handle("/api/subscription", wrap(subscriptionHandler.GetSubscription))
 	mux.Handle("/api/payment/initiate", wrap(subscriptionHandler.InitiatePayment))
 	mux.Handle("/api/payment/history", wrap(subscriptionHandler.GetPaymentHistory))
+	mux.Handle("/api/payment/validate-promo", wrap(subscriptionHandler.ValidatePromoCode))
 
 	// Protected routes (auth + active subscription required)
 	mux.Handle("/api/whatsapp/init", wrapSub(whatsappHandler.Initialize))
@@ -223,6 +224,26 @@ func main() {
 		}
 	}))
 	mux.Handle("/api/admin/email/promotional", wrapAdmin(adminHandler.SendPromotionalEmail))
+	mux.Handle("/api/admin/promos", wrapAdmin(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			adminHandler.ListPromoCodes(w, r)
+		case http.MethodPost:
+			adminHandler.CreatePromoCode(w, r)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	mux.Handle("/api/admin/promos/", wrapAdmin(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			adminHandler.UpdatePromoCode(w, r)
+		case http.MethodDelete:
+			adminHandler.DeletePromoCode(w, r)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
 
 	logger.Info("Registered API routes:")
 	logger.Info("  • GET  /api/health")

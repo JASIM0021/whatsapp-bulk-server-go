@@ -168,7 +168,51 @@ type Payment struct {
 
 // InitiatePaymentRequest is the frontend request to start a payment
 type InitiatePaymentRequest struct {
-	Plan string `json:"plan"`
+	Plan      string `json:"plan"`
+	PromoCode string `json:"promoCode,omitempty"`
+}
+
+// PromoCode represents a discount code record returned by the API
+type PromoCode struct {
+	ID              string   `json:"id"`
+	Code            string   `json:"code"`
+	DiscountType    string   `json:"discountType"`    // "percentage" | "fixed"
+	DiscountValue   float64  `json:"discountValue"`
+	MaxUses         int      `json:"maxUses"`
+	TimesUsed       int      `json:"timesUsed"`
+	IsActive        bool     `json:"isActive"`
+	ApplicablePlans []string `json:"applicablePlans"` // empty = all plans
+	ExpiresAt       string   `json:"expiresAt,omitempty"`
+	CreatedAt       string   `json:"createdAt"`
+}
+
+// CreatePromoCodeRequest is the request body for creating a promo code
+type CreatePromoCodeRequest struct {
+	Code            string   `json:"code"`
+	DiscountType    string   `json:"discountType"`
+	DiscountValue   float64  `json:"discountValue"`
+	MaxUses         int      `json:"maxUses"`
+	ApplicablePlans []string `json:"applicablePlans"`
+	ExpiresAt       string   `json:"expiresAt,omitempty"` // ISO date string, optional
+}
+
+// UpdatePromoCodeRequest is the request body for updating a promo code
+type UpdatePromoCodeRequest struct {
+	IsActive      *bool    `json:"isActive,omitempty"`
+	MaxUses       *int     `json:"maxUses,omitempty"`
+	DiscountValue *float64 `json:"discountValue,omitempty"`
+}
+
+// ValidatePromoResponse is the response for promo code validation
+type ValidatePromoResponse struct {
+	Valid          bool    `json:"valid"`
+	Code           string  `json:"code"`
+	DiscountType   string  `json:"discountType"`
+	DiscountValue  float64 `json:"discountValue"`
+	OriginalAmount float64 `json:"originalAmount"`
+	FinalAmount    float64 `json:"finalAmount"`
+	DiscountAmount float64 `json:"discountAmount"`
+	Message        string  `json:"message,omitempty"` // error reason if invalid
 }
 
 // PayUFormData is returned to frontend to build the hidden form POST to PayU

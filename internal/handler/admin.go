@@ -823,6 +823,100 @@ func (h *AdminHandler) UpdatePlanConfig(w http.ResponseWriter, r *http.Request) 
 	respondJSON(w, map[string]interface{}{"success": true, "message": "Plan config updated"})
 }
 
+// ─── Promo Code handlers ───────────────────────────────────────────────────────
+
+// ListPromoCodes returns all promo codes.
+// GET /api/admin/promos
+func (h *AdminHandler) ListPromoCodes(w http.ResponseWriter, r *http.Request) {
+	promos, err := h.subscriptionService.ListPromoCodes(r.Context())
+	if err != nil {
+		respondError(w, "Failed to fetch promo codes", http.StatusInternalServerError)
+		return
+	}
+	respondJSON(w, map[string]interface{}{"success": true, "data": promos})
+}
+
+// CreatePromoCode creates a new promo code.
+// POST /api/admin/promos
+func (h *AdminHandler) CreatePromoCode(w http.ResponseWriter, r *http.Request) {
+	var req types.CreatePromoCodeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.Code == "" {
+		respondError(w, "code is required", http.StatusBadRequest)
+		return
+	}
+	if req.DiscountType != "percentage" && req.DiscountType != "fixed" {
+		respondError(w, "discountType must be 'percentage' or 'fixed'", http.StatusBadRequest)
+		return
+	}
+	if req.DiscountValue <= 0 {
+		respondError(w, "discountValue must be greater than 0", http.StatusBadRequest)
+		return
+	}
+	if req.DiscountType == "percentage" && req.DiscountValue > 100 {
+		respondError(w, "percentage discountValue must be between 0 and 100", http.StatusBadRequest)
+		return
+	}
+
+	adminID, ok := middleware.GetUserID(r)
+	if !ok {
+		respondError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	promo, err := h.subscriptionService.CreatePromoCode(r.Context(), req, adminID)
+	if err != nil {
+		respondError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	respondJSON(w, map[string]interface{}{"success": true, "data": promo})
+}
+
+// UpdatePromoCode partially updates a promo code.
+// PUT /api/admin/promos/{id}
+func (h *AdminHandler) UpdatePromoCode(w http.ResponseWriter, r *http.Request) {
+	id := extractIDFromPath(r.URL.Path, "/api/admin/promos/")
+	if id == "" {
+		respondError(w, "Promo code ID is required", http.StatusBadRequest)
+		return
+	}
+
+	var req types.UpdatePromoCodeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.subscriptionService.UpdatePromoCode(r.Context(), id, req); err != nil {
+		respondError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	respondJSON(w, map[string]interface{}{"success": true, "message": "Promo code updated"})
+}
+
+// DeletePromoCode deletes a promo code by ID.
+// DELETE /api/admin/promos/{id}
+func (h *AdminHandler) DeletePromoCode(w http.ResponseWriter, r *http.Request) {
+	id := extractIDFromPath(r.URL.Path, "/api/admin/promos/")
+	if id == "" {
+		respondError(w, "Promo code ID is required", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.subscriptionService.DeletePromoCode(r.Context(), id); err != nil {
+		respondError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	respondJSON(w, map[string]interface{}{"success": true, "message": "Promo code deleted"})
+}
+
 // ─── User activity handler ─────────────────────────────────────────────────────
 
 // GetUserActivity returns payment history and subscription stats for a user.

@@ -69,7 +69,7 @@ func (h *SubscriptionHandler) InitiatePayment(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	formData, err := h.subService.InitiatePayment(r.Context(), userID, req.Plan, user.Email, user.Name, "")
+	formData, err := h.subService.InitiatePayment(r.Context(), userID, req.Plan, user.Email, user.Name, "", req.PromoCode)
 	if err != nil {
 		respondError(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -137,6 +137,34 @@ func (h *SubscriptionHandler) GetPublicPlanPricing(w http.ResponseWriter, r *htt
 	}
 	pricing := h.subService.GetPublicPlanPricing(r.Context())
 	respondJSON(w, types.APIResponse{Success: true, Data: pricing})
+}
+
+// ValidatePromoCode validates a promo code for a given plan.
+// GET /api/payment/validate-promo?code=CODE&plan=monthly
+func (h *SubscriptionHandler) ValidatePromoCode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	code := r.URL.Query().Get("code")
+	plan := r.URL.Query().Get("plan")
+
+	if code == "" {
+		respondError(w, "code is required", http.StatusBadRequest)
+		return
+	}
+	if plan != types.PlanMonthly && plan != types.PlanYearly {
+		respondError(w, "plan must be 'monthly' or 'yearly'", http.StatusBadRequest)
+		return
+	}
+
+	result, err := h.subService.ValidatePromoCode(r.Context(), code, plan)
+	if err != nil {
+		respondError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	respondJSON(w, types.APIResponse{Success: true, Data: result})
 }
 
 // GetPaymentHistory returns the current user's payment history.

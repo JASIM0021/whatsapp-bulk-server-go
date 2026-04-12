@@ -44,6 +44,7 @@ type invoiceDoc struct {
 	Plan           string             `bson:"plan"`
 	OriginalAmount float64            `bson:"original_amount"`
 	FinalAmount    float64            `bson:"final_amount"`
+	PromoCode      string             `bson:"promo_code,omitempty"`
 	TxnID          string             `bson:"txn_id"`
 	MihpayID       string             `bson:"mihpay_id"`
 	Status         string             `bson:"status"`
@@ -74,15 +75,31 @@ type subscriptionDoc struct {
 }
 
 type paymentDoc struct {
-	ID           primitive.ObjectID `bson:"_id,omitempty"`
-	UserID       primitive.ObjectID `bson:"user_id"`
-	TxnID        string             `bson:"txn_id"`
-	Amount       float64            `bson:"amount"`
-	Plan         string             `bson:"plan"`
-	Status       string             `bson:"status"`
-	PayUResponse string             `bson:"payu_response"`
-	MihpayID     string             `bson:"mihpay_id"`
-	CreatedAt    time.Time          `bson:"created_at"`
+	ID             primitive.ObjectID `bson:"_id,omitempty"`
+	UserID         primitive.ObjectID `bson:"user_id"`
+	TxnID          string             `bson:"txn_id"`
+	Amount         float64            `bson:"amount"`
+	OriginalAmount float64            `bson:"original_amount"`
+	Plan           string             `bson:"plan"`
+	Status         string             `bson:"status"`
+	PayUResponse   string             `bson:"payu_response"`
+	MihpayID       string             `bson:"mihpay_id"`
+	PromoCode      string             `bson:"promo_code,omitempty"`
+	CreatedAt      time.Time          `bson:"created_at"`
+}
+
+type promoCodeDoc struct {
+	ID              primitive.ObjectID `bson:"_id,omitempty"`
+	Code            string             `bson:"code"`
+	DiscountType    string             `bson:"discount_type"`
+	DiscountValue   float64            `bson:"discount_value"`
+	MaxUses         int                `bson:"max_uses"`
+	TimesUsed       int                `bson:"times_used"`
+	IsActive        bool               `bson:"is_active"`
+	ApplicablePlans []string           `bson:"applicable_plans"`
+	ExpiresAt       *time.Time         `bson:"expires_at,omitempty"`
+	CreatedAt       time.Time          `bson:"created_at"`
+	CreatedBy       string             `bson:"created_by"`
 }
 
 type SubscriptionService struct {
@@ -342,10 +359,28 @@ func (s *SubscriptionService) CheckMessageQuota(ctx context.Context, userID stri
 	return remaining, nil
 }
 
+// calculateDiscountedAmount returns the final payment amount after applying a discount.
+// Always returns at least 1 (PayU minimum).
+func calculateDiscountedAmount(original float64, discountType string, discountValue float64) float64 {
+	var discounted float64
+	switch discountType {
+	case "percentage":
+		discounted = original * (1 - discountValue/100)
+	case "fixed":
+		discounted = original - discountValue
+	default:
+		return original
+	}
+	if discounted < 1 {
+		discounted = 1
+	}
+	return math.Round(discounted*100) / 100
+}
+
 // InitiatePayment creates a payment record and returns PayU form data.
-func (s *SubscriptionService) InitiatePayment(ctx context.Context, userID, plan, email, name, phone string) (*types.PayUFormData, error) {
-	amount, _, err := s.GetPlanConfig(ctx, plan)
-	if err != nil || amount == 0 {
+func (s *SubscriptionService) InitiatePayment(ctx context.Context, userID, plan, email, name, phone, promoCode string) (*types.PayUFormData, error) {
+	originalAmount, _, err := s.GetPlanConfig(ctx, plan)
+	if err != nil || originalAmount == 0 {
 		return nil, fmt.Errorf("invalid plan: %s (must be 'monthly' or 'yearly')", plan)
 	}
 
@@ -354,22 +389,42 @@ func (s *SubscriptionService) InitiatePayment(ctx context.Context, userID, plan,
 		return nil, fmt.Errorf("invalid user ID")
 	}
 
+	amount := originalAmount
+	appliedPromo := ""
+
+	// Apply promo code if provided
+	if promoCode != "" {
+		validation, valErr := s.ValidatePromoCode(ctx, promoCode, plan)
+		if valErr == nil && validation.Valid {
+			amount = validation.FinalAmount
+			appliedPromo = validation.Code
+		}
+		// If invalid, silently ignore the promo and charge full price
+	}
+
 	txnID := fmt.Sprintf("TXN_%s_%d", userID[:8], time.Now().UnixNano())
 	amountStr := fmt.Sprintf("%.2f", amount)
 	productInfo := fmt.Sprintf("BulkSend %s Plan", strings.Title(plan))
 
 	// Store pending payment
 	payDoc := paymentDoc{
-		ID:        primitive.NewObjectID(),
-		UserID:    oid,
-		TxnID:     txnID,
-		Amount:    amount,
-		Plan:      plan,
-		Status:    "pending",
-		CreatedAt: time.Now(),
+		ID:             primitive.NewObjectID(),
+		UserID:         oid,
+		TxnID:          txnID,
+		Amount:         amount,
+		OriginalAmount: originalAmount,
+		Plan:           plan,
+		Status:         "pending",
+		PromoCode:      appliedPromo,
+		CreatedAt:      time.Now(),
 	}
 	if _, err := s.db.Payments().InsertOne(ctx, payDoc); err != nil {
 		return nil, fmt.Errorf("failed to create payment record: %w", err)
+	}
+
+	// Increment promo usage atomically after payment record is created
+	if appliedPromo != "" {
+		_ = s.incrementPromoUsage(ctx, appliedPromo)
 	}
 
 	// Generate PayU hash
@@ -483,8 +538,9 @@ func (s *SubscriptionService) HandlePaymentSuccess(ctx context.Context, params m
 			UserName:       userDoc.Name,
 			UserEmail:      userDoc.Email,
 			Plan:           plan,
-			OriginalAmount: payDoc.Amount,
+			OriginalAmount: payDoc.OriginalAmount,
 			FinalAmount:    payDoc.Amount,
+			PromoCode:      payDoc.PromoCode,
 			TxnID:          txnID,
 			MihpayID:       mihpayID,
 			Status:         "pending",
@@ -737,6 +793,224 @@ func invoiceDocToAPI(d invoiceDoc) types.Invoice {
 		Status:         d.Status,
 		CreatedAt:      d.CreatedAt.Format(time.RFC3339),
 		SentAt:         sentAt,
+	}
+}
+
+// ─── Promo Code Service Methods ────────────────────────────────────────────────
+
+// ValidatePromoCode checks whether a promo code is valid for the given plan.
+func (s *SubscriptionService) ValidatePromoCode(ctx context.Context, code, plan string) (*types.ValidatePromoResponse, error) {
+	code = strings.ToUpper(strings.TrimSpace(code))
+
+	var doc promoCodeDoc
+	err := s.db.PromoCodes().FindOne(ctx, bson.M{"code": code}).Decode(&doc)
+	if err == mongo.ErrNoDocuments {
+		return &types.ValidatePromoResponse{Valid: false, Message: "Invalid promo code"}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("database error: %w", err)
+	}
+
+	if !doc.IsActive {
+		return &types.ValidatePromoResponse{Valid: false, Message: "Promo code is not active"}, nil
+	}
+	if doc.ExpiresAt != nil && doc.ExpiresAt.Before(time.Now()) {
+		return &types.ValidatePromoResponse{Valid: false, Message: "Promo code has expired"}, nil
+	}
+	if doc.MaxUses > 0 && doc.TimesUsed >= doc.MaxUses {
+		return &types.ValidatePromoResponse{Valid: false, Message: "Promo code usage limit reached"}, nil
+	}
+	if len(doc.ApplicablePlans) > 0 {
+		found := false
+		for _, p := range doc.ApplicablePlans {
+			if p == plan {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return &types.ValidatePromoResponse{Valid: false, Message: "Promo code not valid for this plan"}, nil
+		}
+	}
+
+	originalAmount, _, err := s.GetPlanConfig(ctx, plan)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get plan config: %w", err)
+	}
+
+	finalAmount := calculateDiscountedAmount(originalAmount, doc.DiscountType, doc.DiscountValue)
+	discountAmount := originalAmount - finalAmount
+
+	return &types.ValidatePromoResponse{
+		Valid:          true,
+		Code:           doc.Code,
+		DiscountType:   doc.DiscountType,
+		DiscountValue:  doc.DiscountValue,
+		OriginalAmount: originalAmount,
+		FinalAmount:    finalAmount,
+		DiscountAmount: math.Round(discountAmount*100) / 100,
+	}, nil
+}
+
+// incrementPromoUsage atomically increments the times_used counter.
+// If max_uses is reached, also deactivates the promo.
+func (s *SubscriptionService) incrementPromoUsage(ctx context.Context, code string) error {
+	// First increment
+	result := s.db.PromoCodes().FindOneAndUpdate(ctx,
+		bson.M{"code": code},
+		bson.M{"$inc": bson.M{"times_used": 1}},
+		options.FindOneAndUpdate().SetReturnDocument(options.After),
+	)
+	var updated promoCodeDoc
+	if err := result.Decode(&updated); err != nil {
+		return err
+	}
+	// Deactivate if usage limit reached
+	if updated.MaxUses > 0 && updated.TimesUsed >= updated.MaxUses {
+		s.db.PromoCodes().UpdateOne(ctx, //nolint:errcheck
+			bson.M{"code": code},
+			bson.M{"$set": bson.M{"is_active": false}},
+		)
+	}
+	return nil
+}
+
+// CreatePromoCode creates a new promo code.
+func (s *SubscriptionService) CreatePromoCode(ctx context.Context, req types.CreatePromoCodeRequest, adminID string) (*types.PromoCode, error) {
+	code := strings.ToUpper(strings.TrimSpace(req.Code))
+	if code == "" {
+		return nil, fmt.Errorf("code is required")
+	}
+
+	var expiresAt *time.Time
+	if req.ExpiresAt != "" {
+		t, err := time.Parse("2006-01-02", req.ExpiresAt)
+		if err != nil {
+			return nil, fmt.Errorf("invalid expiresAt format (use YYYY-MM-DD)")
+		}
+		expiresAt = &t
+	}
+
+	applicable := req.ApplicablePlans
+	if applicable == nil {
+		applicable = []string{}
+	}
+
+	doc := promoCodeDoc{
+		ID:              primitive.NewObjectID(),
+		Code:            code,
+		DiscountType:    req.DiscountType,
+		DiscountValue:   req.DiscountValue,
+		MaxUses:         req.MaxUses,
+		TimesUsed:       0,
+		IsActive:        true,
+		ApplicablePlans: applicable,
+		ExpiresAt:       expiresAt,
+		CreatedAt:       time.Now(),
+		CreatedBy:       adminID,
+	}
+
+	if _, err := s.db.PromoCodes().InsertOne(ctx, doc); err != nil {
+		if mongo.IsDuplicateKeyError(err) {
+			return nil, fmt.Errorf("promo code already exists")
+		}
+		return nil, fmt.Errorf("failed to create promo code: %w", err)
+	}
+
+	result := promoDocToAPI(doc)
+	return &result, nil
+}
+
+// ListPromoCodes returns all promo codes sorted by created_at desc.
+func (s *SubscriptionService) ListPromoCodes(ctx context.Context) ([]types.PromoCode, error) {
+	cursor, err := s.db.PromoCodes().Find(ctx, bson.M{},
+		options.Find().SetSort(bson.D{{Key: "created_at", Value: -1}}))
+	if err != nil {
+		return nil, fmt.Errorf("database error: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	var docs []promoCodeDoc
+	if err := cursor.All(ctx, &docs); err != nil {
+		return nil, err
+	}
+
+	result := make([]types.PromoCode, len(docs))
+	for i, d := range docs {
+		result[i] = promoDocToAPI(d)
+	}
+	return result, nil
+}
+
+// UpdatePromoCode partially updates a promo code by ID.
+func (s *SubscriptionService) UpdatePromoCode(ctx context.Context, id string, req types.UpdatePromoCodeRequest) error {
+	oid, err := primitive.ObjectIDFromHex(id)
+	if err != nil {
+		return fmt.Errorf("invalid promo code ID")
+	}
+
+	update := bson.M{}
+	if req.IsActive != nil {
+		update["is_active"] = *req.IsActive
+	}
+	if req.MaxUses != nil {
+		update["max_uses"] = *req.MaxUses
+	}
+	if req.DiscountValue != nil {
+		update["discount_value"] = *req.DiscountValue
+	}
+
+	if len(update) == 0 {
+		return fmt.Errorf("no fields to update")
+	}
+
+	result, err := s.db.PromoCodes().UpdateOne(ctx, bson.M{"_id": oid}, bson.M{"$set": update})
+	if err != nil {
+		return err
+	}
+	if result.MatchedCount == 0 {
+		return fmt.Errorf("promo code not found")
+	}
+	return nil
+}
+
+// DeletePromoCode removes a promo code by ID.
+func (s *SubscriptionService) DeletePromoCode(ctx context.Context, id string) error {
+	oid, err := primitive.ObjectIDFromHex(id)
+	if err != nil {
+		return fmt.Errorf("invalid promo code ID")
+	}
+
+	result, err := s.db.PromoCodes().DeleteOne(ctx, bson.M{"_id": oid})
+	if err != nil {
+		return err
+	}
+	if result.DeletedCount == 0 {
+		return fmt.Errorf("promo code not found")
+	}
+	return nil
+}
+
+func promoDocToAPI(d promoCodeDoc) types.PromoCode {
+	expiresAt := ""
+	if d.ExpiresAt != nil {
+		expiresAt = d.ExpiresAt.Format("2006-01-02")
+	}
+	plans := d.ApplicablePlans
+	if plans == nil {
+		plans = []string{}
+	}
+	return types.PromoCode{
+		ID:              d.ID.Hex(),
+		Code:            d.Code,
+		DiscountType:    d.DiscountType,
+		DiscountValue:   d.DiscountValue,
+		MaxUses:         d.MaxUses,
+		TimesUsed:       d.TimesUsed,
+		IsActive:        d.IsActive,
+		ApplicablePlans: plans,
+		ExpiresAt:       expiresAt,
+		CreatedAt:       d.CreatedAt.Format(time.RFC3339),
 	}
 }
 
