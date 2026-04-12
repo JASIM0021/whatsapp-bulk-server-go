@@ -233,6 +233,49 @@ type VerifyOTPRequest struct {
 	Code  string `json:"code"`
 }
 
+// Invoice represents an invoice record created on payment success.
+type Invoice struct {
+	ID             string  `json:"id"`
+	InvoiceNumber  string  `json:"invoiceNumber"`
+	UserID         string  `json:"userId"`
+	UserName       string  `json:"userName"`
+	UserEmail      string  `json:"userEmail"`
+	Plan           string  `json:"plan"`
+	OriginalAmount float64 `json:"originalAmount"`
+	FinalAmount    float64 `json:"finalAmount"`
+	TxnID          string  `json:"txnId"`
+	MihpayID       string  `json:"mihpayId"`
+	PaymentDate    string  `json:"paymentDate"`
+	ExpiryDate     string  `json:"expiryDate"`
+	Status         string  `json:"status"`
+	CreatedAt      string  `json:"createdAt"`
+	SentAt         string  `json:"sentAt,omitempty"`
+}
+
+// PlanConfig represents the pricing configuration for a subscription plan.
+type PlanConfig struct {
+	Plan         string  `json:"plan"`
+	Amount       float64 `json:"amount"`
+	MessageLimit int     `json:"messageLimit"`
+	UpdatedAt    string  `json:"updatedAt"`
+}
+
+// UpdatePlanConfigRequest is the request body for updating plan pricing.
+type UpdatePlanConfigRequest struct {
+	Amount       float64 `json:"amount"`
+	MessageLimit int     `json:"messageLimit,omitempty"`
+}
+
+// UpdateInvoiceRequest is the request body for updating an invoice amount.
+type UpdateInvoiceRequest struct {
+	FinalAmount float64 `json:"finalAmount"`
+}
+
+// ApproveInvoiceRequest is the request body for approving and sending an invoice.
+type ApproveInvoiceRequest struct {
+	Amount float64 `json:"amount,omitempty"`
+}
+
 // contextKey is the type for context keys to avoid collisions
 type contextKey string
 

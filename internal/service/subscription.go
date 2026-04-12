@@ -35,6 +35,32 @@ var planDuration = map[string]time.Duration{
 // Free trial message limit
 const FreeMessageLimit = 5
 
+type invoiceDoc struct {
+	ID             primitive.ObjectID `bson:"_id,omitempty"`
+	InvoiceNumber  string             `bson:"invoice_number"`
+	UserID         primitive.ObjectID `bson:"user_id"`
+	UserName       string             `bson:"user_name"`
+	UserEmail      string             `bson:"user_email"`
+	Plan           string             `bson:"plan"`
+	OriginalAmount float64            `bson:"original_amount"`
+	FinalAmount    float64            `bson:"final_amount"`
+	TxnID          string             `bson:"txn_id"`
+	MihpayID       string             `bson:"mihpay_id"`
+	Status         string             `bson:"status"`
+	PaymentDate    time.Time          `bson:"payment_date"`
+	ExpiryDate     time.Time          `bson:"expiry_date"`
+	CreatedAt      time.Time          `bson:"created_at"`
+	SentAt         *time.Time         `bson:"sent_at,omitempty"`
+}
+
+type planConfigDoc struct {
+	ID           primitive.ObjectID `bson:"_id,omitempty"`
+	Plan         string             `bson:"plan"`
+	Amount       float64            `bson:"amount"`
+	MessageLimit int                `bson:"message_limit"`
+	UpdatedAt    time.Time          `bson:"updated_at"`
+}
+
 type subscriptionDoc struct {
 	ID           primitive.ObjectID `bson:"_id,omitempty"`
 	UserID       primitive.ObjectID `bson:"user_id"`
@@ -318,8 +344,8 @@ func (s *SubscriptionService) CheckMessageQuota(ctx context.Context, userID stri
 
 // InitiatePayment creates a payment record and returns PayU form data.
 func (s *SubscriptionService) InitiatePayment(ctx context.Context, userID, plan, email, name, phone string) (*types.PayUFormData, error) {
-	amount, ok := planPricing[plan]
-	if !ok {
+	amount, _, err := s.GetPlanConfig(ctx, plan)
+	if err != nil || amount == 0 {
 		return nil, fmt.Errorf("invalid plan: %s (must be 'monthly' or 'yearly')", plan)
 	}
 
@@ -433,28 +459,45 @@ func (s *SubscriptionService) HandlePaymentSuccess(ctx context.Context, params m
 
 	logger.Success("Subscription activated: user=%s plan=%s expires=%s", userID, plan, now.Add(duration).Format("2006-01-02"))
 
-	// Send invoice email (non-blocking)
-	if s.emailSvc != nil {
-		go func() {
-			var userDoc struct {
-				Email string `bson:"email"`
-				Name  string `bson:"name"`
-			}
-			if err := s.db.Users().FindOne(ctx, bson.M{"_id": oid}).Decode(&userDoc); err == nil {
-				amount, _ := planPricing[plan]
-				s.emailSvc.SendInvoiceEmail(InvoiceData{
-					UserName:    userDoc.Name,
-					UserEmail:   userDoc.Email,
-					Plan:        plan,
-					Amount:      fmt.Sprintf("%.2f", amount),
-					TxnID:       txnID,
-					PaymentID:   mihpayID,
-					PaymentDate: now,
-					ExpiryDate:  now.Add(duration),
-				})
-			}
-		}()
-	}
+	// Create pending invoice record (non-fatal if fails)
+	func() {
+		var payDoc paymentDoc
+		if fetchErr := s.db.Payments().FindOne(ctx, bson.M{"txn_id": txnID}).Decode(&payDoc); fetchErr != nil {
+			logger.Error("Invoice creation: failed to fetch payment doc: %v", fetchErr)
+			return
+		}
+		var userDoc struct {
+			Email string `bson:"email"`
+			Name  string `bson:"name"`
+		}
+		if fetchErr := s.db.Users().FindOne(ctx, bson.M{"_id": oid}).Decode(&userDoc); fetchErr != nil {
+			logger.Error("Invoice creation: failed to fetch user doc: %v", fetchErr)
+			return
+		}
+		invID := primitive.NewObjectID()
+		hexStr := invID.Hex()
+		invDoc := invoiceDoc{
+			ID:             invID,
+			InvoiceNumber:  fmt.Sprintf("INV-%s-%s", now.Format("200601"), hexStr[len(hexStr)-6:]),
+			UserID:         oid,
+			UserName:       userDoc.Name,
+			UserEmail:      userDoc.Email,
+			Plan:           plan,
+			OriginalAmount: payDoc.Amount,
+			FinalAmount:    payDoc.Amount,
+			TxnID:          txnID,
+			MihpayID:       mihpayID,
+			Status:         "pending",
+			PaymentDate:    now,
+			ExpiryDate:     now.Add(duration),
+			CreatedAt:      now,
+		}
+		if _, insertErr := s.db.Invoices().InsertOne(ctx, invDoc); insertErr != nil {
+			logger.Error("Failed to create invoice: %v", insertErr)
+		} else {
+			logger.Info("Invoice created: %s for user %s", invDoc.InvoiceNumber, oid.Hex())
+		}
+	}()
 
 	return txnID, nil
 }
@@ -519,6 +562,182 @@ func (s *SubscriptionService) GetPaymentHistory(ctx context.Context, userID stri
 // GetFrontendURL returns the frontend URL for redirects.
 func (s *SubscriptionService) GetFrontendURL() string {
 	return s.frontendURL
+}
+
+// GetPlanConfig returns pricing and message limit for a plan, falling back to defaults.
+func (s *SubscriptionService) GetPlanConfig(ctx context.Context, plan string) (amount float64, messageLimit int, err error) {
+	var doc planConfigDoc
+	fetchErr := s.db.PlanConfigs().FindOne(ctx, bson.M{"plan": plan}).Decode(&doc)
+	if fetchErr == nil {
+		return doc.Amount, doc.MessageLimit, nil
+	}
+	if fetchErr != mongo.ErrNoDocuments {
+		return 0, 0, fmt.Errorf("failed to query plan config: %w", fetchErr)
+	}
+	// Fall back to hardcoded defaults
+	switch plan {
+	case "monthly":
+		return planPricing["monthly"], 0, nil
+	case "yearly":
+		return planPricing["yearly"], 0, nil
+	case "free":
+		return 0, FreeMessageLimit, nil
+	default:
+		return 0, 0, fmt.Errorf("invalid plan: %s", plan)
+	}
+}
+
+// GetPublicPlanPricing returns pricing info for all plans.
+func (s *SubscriptionService) GetPublicPlanPricing(ctx context.Context) map[string]interface{} {
+	result := make(map[string]interface{})
+	for _, plan := range []string{"free", "monthly", "yearly"} {
+		amount, messageLimit, _ := s.GetPlanConfig(ctx, plan)
+		result[plan] = map[string]interface{}{
+			"amount":       amount,
+			"messageLimit": messageLimit,
+		}
+	}
+	return result
+}
+
+// UpdatePlanConfig upserts pricing configuration for a plan.
+func (s *SubscriptionService) UpdatePlanConfig(ctx context.Context, plan string, amount float64, messageLimit int) error {
+	opts := options.Replace().SetUpsert(true)
+	_, err := s.db.PlanConfigs().ReplaceOne(ctx,
+		bson.M{"plan": plan},
+		planConfigDoc{
+			Plan:         plan,
+			Amount:       amount,
+			MessageLimit: messageLimit,
+			UpdatedAt:    time.Now(),
+		},
+		opts,
+	)
+	return err
+}
+
+// ListInvoices returns paginated invoices filtered by status.
+func (s *SubscriptionService) ListInvoices(ctx context.Context, status string, page, limit int) ([]types.Invoice, int64, error) {
+	filter := bson.M{}
+	if status != "" && status != "all" {
+		filter["status"] = status
+	}
+
+	total, err := s.db.Invoices().CountDocuments(ctx, filter)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	skip := int64((page - 1) * limit)
+	cursor, err := s.db.Invoices().Find(ctx, filter, options.Find().
+		SetSort(bson.D{{Key: "created_at", Value: -1}}).
+		SetSkip(skip).
+		SetLimit(int64(limit)))
+	if err != nil {
+		return nil, 0, err
+	}
+	defer cursor.Close(ctx)
+
+	var docs []invoiceDoc
+	if err := cursor.All(ctx, &docs); err != nil {
+		return nil, 0, err
+	}
+
+	invoices := make([]types.Invoice, len(docs))
+	for i, d := range docs {
+		invoices[i] = invoiceDocToAPI(d)
+	}
+	return invoices, total, nil
+}
+
+// UpdateInvoiceAmount updates the final_amount of a pending invoice.
+func (s *SubscriptionService) UpdateInvoiceAmount(ctx context.Context, invoiceID string, finalAmount float64) error {
+	oid, err := primitive.ObjectIDFromHex(invoiceID)
+	if err != nil {
+		return fmt.Errorf("invalid invoice ID")
+	}
+	result, err := s.db.Invoices().UpdateOne(ctx,
+		bson.M{"_id": oid, "status": "pending"},
+		bson.M{"$set": bson.M{"final_amount": finalAmount}},
+	)
+	if err != nil {
+		return err
+	}
+	if result.MatchedCount == 0 {
+		return fmt.Errorf("invoice not found or not pending")
+	}
+	return nil
+}
+
+// ApproveAndSendInvoice sends the invoice email and marks it as sent.
+func (s *SubscriptionService) ApproveAndSendInvoice(ctx context.Context, invoiceID string, overrideAmount float64) error {
+	oid, err := primitive.ObjectIDFromHex(invoiceID)
+	if err != nil {
+		return fmt.Errorf("invalid invoice ID")
+	}
+
+	var doc invoiceDoc
+	if err := s.db.Invoices().FindOne(ctx, bson.M{"_id": oid}).Decode(&doc); err != nil {
+		return fmt.Errorf("invoice not found")
+	}
+
+	if doc.Status == "sent" {
+		return fmt.Errorf("invoice already sent")
+	}
+
+	if s.emailSvc == nil {
+		return fmt.Errorf("email service not configured")
+	}
+
+	finalAmount := doc.FinalAmount
+	if overrideAmount > 0 {
+		finalAmount = overrideAmount
+	}
+
+	if err := s.emailSvc.SendInvoiceEmail(InvoiceData{
+		UserName:    doc.UserName,
+		UserEmail:   doc.UserEmail,
+		Plan:        doc.Plan,
+		Amount:      fmt.Sprintf("%.2f", finalAmount),
+		TxnID:       doc.TxnID,
+		PaymentID:   doc.MihpayID,
+		PaymentDate: doc.PaymentDate,
+		ExpiryDate:  doc.ExpiryDate,
+	}); err != nil {
+		return fmt.Errorf("failed to send email: %w", err)
+	}
+
+	now := time.Now()
+	_, err = s.db.Invoices().UpdateOne(ctx, bson.M{"_id": oid}, bson.M{"$set": bson.M{
+		"status":       "sent",
+		"sent_at":      now,
+		"final_amount": finalAmount,
+	}})
+	return err
+}
+
+func invoiceDocToAPI(d invoiceDoc) types.Invoice {
+	sentAt := ""
+	if d.SentAt != nil {
+		sentAt = d.SentAt.Format(time.RFC3339)
+	}
+	return types.Invoice{
+		ID:             d.ID.Hex(),
+		InvoiceNumber:  d.InvoiceNumber,
+		UserID:         d.UserID.Hex(),
+		UserName:       d.UserName,
+		UserEmail:      d.UserEmail,
+		Plan:           d.Plan,
+		OriginalAmount: d.OriginalAmount,
+		FinalAmount:    d.FinalAmount,
+		TxnID:          d.TxnID,
+		MihpayID:       d.MihpayID,
+		PaymentDate:    d.PaymentDate.Format(time.RFC3339),
+		ExpiryDate:     d.ExpiryDate.Format("2006-01-02"),
+		Status:         d.Status,
+		CreatedAt:      d.CreatedAt.Format(time.RFC3339),
+		SentAt:         sentAt,
+	}
 }
 
 // PayU hash generation

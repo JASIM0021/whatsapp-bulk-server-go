@@ -129,6 +129,16 @@ func (h *SubscriptionHandler) PaymentFailure(w http.ResponseWriter, r *http.Requ
 	http.Redirect(w, r, fmt.Sprintf("%s/payment/failure?txnid=%s", h.subService.GetFrontendURL(), txnID), http.StatusSeeOther)
 }
 
+// GetPublicPlanPricing returns live plan pricing (no auth required).
+func (h *SubscriptionHandler) GetPublicPlanPricing(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	pricing := h.subService.GetPublicPlanPricing(r.Context())
+	respondJSON(w, types.APIResponse{Success: true, Data: pricing})
+}
+
 // GetPaymentHistory returns the current user's payment history.
 func (h *SubscriptionHandler) GetPaymentHistory(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {

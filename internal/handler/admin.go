@@ -20,14 +20,15 @@ import (
 
 // AdminHandler handles admin panel API endpoints.
 type AdminHandler struct {
-	db           *mongo.Database
-	authService  *service.AuthService
-	emailService *service.EmailService
+	db                  *mongo.Database
+	authService         *service.AuthService
+	emailService        *service.EmailService
+	subscriptionService *service.SubscriptionService
 }
 
 // NewAdminHandler creates a new AdminHandler.
-func NewAdminHandler(db *mongo.Database, authService *service.AuthService, emailService *service.EmailService) *AdminHandler {
-	return &AdminHandler{db: db, authService: authService, emailService: emailService}
+func NewAdminHandler(db *mongo.Database, authService *service.AuthService, emailService *service.EmailService, subscriptionService *service.SubscriptionService) *AdminHandler {
+	return &AdminHandler{db: db, authService: authService, emailService: emailService, subscriptionService: subscriptionService}
 }
 
 // GetStats returns high-level dashboard statistics.
@@ -652,13 +653,264 @@ func (h *AdminHandler) SendPromotionalEmail(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-// extractUserIDFromPath extracts the last path segment as a user ID.
-// e.g., "/api/admin/users/6612a..." → "6612a..."
+// extractUserIDFromPath extracts the user ID segment from a /api/admin/users/{id} path.
 func extractUserIDFromPath(path string) string {
-	trimmed := strings.TrimPrefix(path, "/api/admin/users/")
+	return extractIDFromPath(path, "/api/admin/users/")
+}
+
+// extractIDFromPath extracts the last non-empty, slash-free segment after the given prefix.
+func extractIDFromPath(path, prefix string) string {
+	trimmed := strings.TrimPrefix(path, prefix)
 	trimmed = strings.TrimSuffix(trimmed, "/")
 	if trimmed == "" || strings.Contains(trimmed, "/") {
 		return ""
 	}
 	return trimmed
+}
+
+// ─── Invoice handlers ─────────────────────────────────────────────────────────
+
+// ListInvoices returns paginated invoices.
+// GET /api/admin/invoices?status=&page=&limit=
+func (h *AdminHandler) ListInvoices(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	status := r.URL.Query().Get("status")
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 100 {
+		limit = 20
+	}
+
+	invoices, total, err := h.subscriptionService.ListInvoices(r.Context(), status, page, limit)
+	if err != nil {
+		respondError(w, "Failed to fetch invoices", http.StatusInternalServerError)
+		return
+	}
+
+	respondJSON(w, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"invoices": invoices,
+			"total":    total,
+			"page":     page,
+			"limit":    limit,
+		},
+	})
+}
+
+// UpdateInvoice updates the final amount of a pending invoice.
+// PUT /api/admin/invoices/{id}
+func (h *AdminHandler) UpdateInvoice(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		respondError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	invoiceID := extractIDFromPath(r.URL.Path, "/api/admin/invoices/")
+	if invoiceID == "" {
+		respondError(w, "Invoice ID is required", http.StatusBadRequest)
+		return
+	}
+
+	var req types.UpdateInvoiceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.subscriptionService.UpdateInvoiceAmount(r.Context(), invoiceID, req.FinalAmount); err != nil {
+		respondError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	respondJSON(w, map[string]interface{}{"success": true, "message": "Invoice updated"})
+}
+
+// ApproveInvoice approves and sends an invoice email to the user.
+// POST /api/admin/invoices/{id}/approve
+func (h *AdminHandler) ApproveInvoice(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Path: /api/admin/invoices/{id}/approve
+	trimmed := strings.TrimPrefix(r.URL.Path, "/api/admin/invoices/")
+	trimmed = strings.TrimSuffix(trimmed, "/approve")
+	parts := strings.SplitN(trimmed, "/", 2)
+	invoiceID := parts[0]
+
+	if invoiceID == "" {
+		respondError(w, "Invoice ID is required", http.StatusBadRequest)
+		return
+	}
+
+	var req types.ApproveInvoiceRequest
+	json.NewDecoder(r.Body).Decode(&req) // body is optional
+
+	if err := h.subscriptionService.ApproveAndSendInvoice(r.Context(), invoiceID, req.Amount); err != nil {
+		respondError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	respondJSON(w, map[string]interface{}{"success": true, "message": "Invoice approved and sent"})
+}
+
+// ─── Plan config handlers ──────────────────────────────────────────────────────
+
+// GetPlanConfigs returns current pricing config for all plans.
+// GET /api/admin/plans
+func (h *AdminHandler) GetPlanConfigs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx := r.Context()
+	planNames := []string{"free", "monthly", "yearly"}
+	result := make([]types.PlanConfig, 0, len(planNames))
+	for _, plan := range planNames {
+		amount, messageLimit, err := h.subscriptionService.GetPlanConfig(ctx, plan)
+		if err != nil {
+			continue
+		}
+		result = append(result, types.PlanConfig{
+			Plan:         plan,
+			Amount:       amount,
+			MessageLimit: messageLimit,
+		})
+	}
+
+	respondJSON(w, map[string]interface{}{"success": true, "data": result})
+}
+
+// UpdatePlanConfig updates pricing/limits for a plan.
+// PUT /api/admin/plans/{plan}
+func (h *AdminHandler) UpdatePlanConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		respondError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	planName := extractIDFromPath(r.URL.Path, "/api/admin/plans/")
+	if planName == "" {
+		respondError(w, "Plan name is required", http.StatusBadRequest)
+		return
+	}
+	if planName != "monthly" && planName != "yearly" && planName != "free" {
+		respondError(w, "Plan must be 'monthly', 'yearly', or 'free'", http.StatusBadRequest)
+		return
+	}
+
+	var req types.UpdatePlanConfigRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.subscriptionService.UpdatePlanConfig(r.Context(), planName, req.Amount, req.MessageLimit); err != nil {
+		respondError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	respondJSON(w, map[string]interface{}{"success": true, "message": "Plan config updated"})
+}
+
+// ─── User activity handler ─────────────────────────────────────────────────────
+
+// GetUserActivity returns payment history and subscription stats for a user.
+// GET /api/admin/users/{id}/activity
+func (h *AdminHandler) GetUserActivity(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse: /api/admin/users/{id}/activity
+	trimmed := strings.TrimPrefix(r.URL.Path, "/api/admin/users/")
+	parts := strings.SplitN(trimmed, "/", 2)
+	userID := parts[0]
+
+	if userID == "" {
+		respondError(w, "User ID is required", http.StatusBadRequest)
+		return
+	}
+
+	oid, err := primitive.ObjectIDFromHex(userID)
+	if err != nil {
+		respondError(w, "Invalid user ID", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+
+	// Fetch payments
+	cursor, err := h.db.Collection("payments").Find(ctx,
+		bson.M{"user_id": oid},
+		options.Find().SetSort(bson.D{{Key: "created_at", Value: -1}}),
+	)
+	if err != nil {
+		respondError(w, "Failed to fetch payments", http.StatusInternalServerError)
+		return
+	}
+	defer cursor.Close(ctx)
+
+	var payDocs []bson.M
+	if err := cursor.All(ctx, &payDocs); err != nil {
+		respondError(w, "Failed to decode payments", http.StatusInternalServerError)
+		return
+	}
+
+	payments := make([]map[string]interface{}, 0, len(payDocs))
+	for _, d := range payDocs {
+		var idStr, userIDStr string
+		if id, ok := d["_id"].(primitive.ObjectID); ok {
+			idStr = id.Hex()
+		}
+		if uid, ok := d["user_id"].(primitive.ObjectID); ok {
+			userIDStr = uid.Hex()
+		}
+		payments = append(payments, map[string]interface{}{
+			"id":        idStr,
+			"userId":    userIDStr,
+			"txnId":     d["txn_id"],
+			"amount":    d["amount"],
+			"plan":      d["plan"],
+			"status":    d["status"],
+			"mihpayId":  d["mihpay_id"],
+			"createdAt": d["created_at"],
+		})
+	}
+
+	// Fetch subscription
+	var subDoc bson.M
+	h.db.Collection("subscriptions").FindOne(ctx, bson.M{"user_id": oid}).Decode(&subDoc) //nolint:errcheck
+
+	subInfo := map[string]interface{}{
+		"messagesUsed": 0,
+		"messageLimit": 0,
+		"plan":         "",
+		"status":       "",
+	}
+	if subDoc != nil {
+		subInfo["messagesUsed"] = subDoc["messages_used"]
+		subInfo["messageLimit"] = subDoc["message_limit"]
+		subInfo["plan"] = subDoc["plan"]
+		subInfo["status"] = subDoc["status"]
+	}
+
+	respondJSON(w, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"payments":     payments,
+			"subscription": subInfo,
+		},
+	})
 }

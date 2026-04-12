@@ -100,6 +100,34 @@ func (d *DB) EnsureIndexes(ctx context.Context) error {
 		Keys:    bson.D{{Key: "expires_at", Value: 1}},
 		Options: options.Index().SetExpireAfterSeconds(expireAfter),
 	})
+	if err != nil {
+		return err
+	}
+	// Invoices indexes
+	_, err = d.Invoices().Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys: bson.D{{Key: "user_id", Value: 1}, {Key: "created_at", Value: -1}},
+	})
+	if err != nil {
+		return err
+	}
+	_, err = d.Invoices().Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys: bson.D{{Key: "status", Value: 1}},
+	})
+	if err != nil {
+		return err
+	}
+	_, err = d.Invoices().Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "invoice_number", Value: 1}},
+		Options: options.Index().SetUnique(true),
+	})
+	if err != nil {
+		return err
+	}
+	// PlanConfigs: one entry per plan
+	_, err = d.PlanConfigs().Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "plan", Value: 1}},
+		Options: options.Index().SetUnique(true),
+	})
 	return err
 }
 
@@ -112,6 +140,8 @@ func (d *DB) Payments() *mongo.Collection      { return d.mdb.Collection("paymen
 func (d *DB) Contacts() *mongo.Collection      { return d.mdb.Collection("contacts") }
 func (d *DB) EmailOTPs() *mongo.Collection       { return d.mdb.Collection("email_otps") }
 func (d *DB) PasswordResets() *mongo.Collection { return d.mdb.Collection("password_resets") }
+func (d *DB) Invoices() *mongo.Collection      { return d.mdb.Collection("invoices") }
+func (d *DB) PlanConfigs() *mongo.Collection   { return d.mdb.Collection("plan_configs") }
 
 func (d *DB) Close(ctx context.Context) error {
 	return d.client.Disconnect(ctx)

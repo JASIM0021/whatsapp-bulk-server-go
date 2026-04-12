@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -101,7 +102,7 @@ func main() {
 	whatsappHandler.SetSubscriptionService(subscriptionService)
 	uploadHandler := handler.NewUploadHandler()
 	imageHandler := handler.NewImageHandler()
-	adminHandler := handler.NewAdminHandler(appDB.MongoDB(), authService, emailService)
+	adminHandler := handler.NewAdminHandler(appDB.MongoDB(), authService, emailService, subscriptionService)
 	contactsHandler := handler.NewContactsHandler(appDB)
 
 	// Auth middleware helper
@@ -117,6 +118,9 @@ func main() {
 
 	// Create HTTP mux
 	mux := http.NewServeMux()
+
+	// Public plan pricing (no auth — used by subscription page)
+	mux.HandleFunc("/api/subscription/plans", subscriptionHandler.GetPublicPlanPricing)
 
 	// Public routes
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
@@ -173,6 +177,10 @@ func main() {
 		}
 	}))
 	mux.Handle("/api/admin/users/", wrapAdmin(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/activity") && r.Method == http.MethodGet {
+			adminHandler.GetUserActivity(w, r)
+			return
+		}
 		switch r.Method {
 		case http.MethodGet:
 			adminHandler.GetUser(w, r)
@@ -181,6 +189,36 @@ func main() {
 		case http.MethodDelete:
 			adminHandler.DeleteUser(w, r)
 		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	mux.Handle("/api/admin/invoices", wrapAdmin(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			adminHandler.ListInvoices(w, r)
+		} else {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	mux.Handle("/api/admin/invoices/", wrapAdmin(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/approve") && r.Method == http.MethodPost {
+			adminHandler.ApproveInvoice(w, r)
+		} else if r.Method == http.MethodPut {
+			adminHandler.UpdateInvoice(w, r)
+		} else {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	mux.Handle("/api/admin/plans", wrapAdmin(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			adminHandler.GetPlanConfigs(w, r)
+		} else {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	mux.Handle("/api/admin/plans/", wrapAdmin(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			adminHandler.UpdatePlanConfig(w, r)
+		} else {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
 	}))
