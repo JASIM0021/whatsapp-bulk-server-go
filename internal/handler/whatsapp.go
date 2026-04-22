@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -16,24 +17,43 @@ import (
 	"github.com/JASIM0021/bulk-whatsapp-send/backend/internal/middleware"
 	"github.com/JASIM0021/bulk-whatsapp-send/backend/internal/service"
 	"github.com/JASIM0021/bulk-whatsapp-send/backend/internal/types"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 type WhatsAppHandler struct {
-	mu         sync.RWMutex
-	services   map[string]*service.WhatsAppService
-	dbDir      string
-	db         *appdb.DB
-	subService *service.SubscriptionService
+	mu              sync.RWMutex
+	services        map[string]*service.WhatsAppService
+	sharedContainer service.SharedContainer // one SQLite DB for all users
+	dbDir           string
+	db              *appdb.DB
+	subService      *service.SubscriptionService
+	botService      *service.BotService
+	imageHandler    *ImageHandler
 }
 
 func NewWhatsAppHandler(dbDir string, database *appdb.DB) *WhatsAppHandler {
 	absDir, _ := filepath.Abs(dbDir)
 	os.MkdirAll(absDir, 0755)
-	return &WhatsAppHandler{
-		services: make(map[string]*service.WhatsAppService),
-		dbDir:    absDir,
-		db:       database,
+
+	sharedDBPath := filepath.Join(absDir, "sessions.db")
+	container, err := service.NewSharedContainer(sharedDBPath)
+	if err != nil {
+		logger.Error("Failed to open shared WhatsApp session DB at %s: %v", sharedDBPath, err)
+		// container will be nil; services will fail to initialize and log clearly
 	}
+
+	return &WhatsAppHandler{
+		services:        make(map[string]*service.WhatsAppService),
+		dbDir:           absDir,
+		db:              database,
+		sharedContainer: container,
+	}
+}
+
+// SetImageHandler wires the image handler so SendMessages can validate path ownership.
+func (h *WhatsAppHandler) SetImageHandler(ih *ImageHandler) {
+	h.imageHandler = ih
 }
 
 // SetSubscriptionService sets the subscription service for message quota tracking.
@@ -41,29 +61,62 @@ func (h *WhatsAppHandler) SetSubscriptionService(subSvc *service.SubscriptionSer
 	h.subService = subSvc
 }
 
-// Shutdown gracefully closes all active WhatsApp WebSocket connections.
-// Sessions are preserved in SQLite so users reconnect automatically on restart.
+// SetBotService injects the bot service so new WhatsApp sessions get bot support.
+func (h *WhatsAppHandler) SetBotService(botSvc *service.BotService) {
+	h.mu.Lock()
+	h.botService = botSvc
+	// Inject into any already-running services
+	for _, svc := range h.services {
+		svc.SetBotService(botSvc)
+	}
+	h.mu.Unlock()
+}
+
+// Shutdown gracefully closes all active WhatsApp WebSocket connections then closes
+// the shared SQLite container. Sessions are preserved in SQLite so users reconnect
+// automatically on next startup without re-scanning QR.
 func (h *WhatsAppHandler) Shutdown() {
 	h.mu.RLock()
-	defer h.mu.RUnlock()
 	for _, svc := range h.services {
 		svc.GracefulShutdown()
+	}
+	h.mu.RUnlock()
+
+	if h.sharedContainer != nil {
+		_ = h.sharedContainer.Close()
 	}
 }
 
 // GetServiceForUser returns the WhatsAppService for a given userID if it exists (read-only, no auto-init).
+// The returned service is guaranteed to have svc.GetUserID() == userID.
 func (h *WhatsAppHandler) GetServiceForUser(userID string) (*service.WhatsAppService, bool) {
+	if userID == "" {
+		return nil, false
+	}
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	svc, ok := h.services[userID]
+	if ok && svc.GetUserID() != userID {
+		// Defensive: should never happen — map key == service.userID by construction.
+		logger.Error("ISOLATION BUG: service in map[%s] has userID=%s — rejecting", userID, svc.GetUserID())
+		return nil, false
+	}
 	return svc, ok
 }
 
 func (h *WhatsAppHandler) getOrCreateService(userID string) (*service.WhatsAppService, error) {
+	if userID == "" {
+		return nil, fmt.Errorf("userID must not be empty")
+	}
 	h.mu.RLock()
 	svc, ok := h.services[userID]
 	h.mu.RUnlock()
 	if ok {
+		// Ownership assertion — map key must equal embedded userID
+		if svc.GetUserID() != userID {
+			logger.Error("ISOLATION BUG: service in map[%s] has userID=%s", userID, svc.GetUserID())
+			return nil, fmt.Errorf("session ownership mismatch — please contact support")
+		}
 		return svc, nil
 	}
 
@@ -74,12 +127,20 @@ func (h *WhatsAppHandler) getOrCreateService(userID string) (*service.WhatsAppSe
 		return svc, nil
 	}
 
-	dbPath := fmt.Sprintf("%s/whatsapp_session_%s.db", h.dbDir, userID)
-	svc, err := service.NewWhatsAppServiceWithPath(dbPath, userID, h.db)
+	svc, err := service.NewWhatsAppServiceWithContainer(h.sharedContainer, userID, h.db)
 	if err != nil {
 		return nil, err
 	}
+	// Final ownership check before storing
+	if svc.GetUserID() != userID {
+		return nil, fmt.Errorf("ISOLATION BUG: newly created service has wrong userID")
+	}
 	h.services[userID] = svc
+
+	// Inject bot service if available
+	if h.botService != nil {
+		svc.SetBotService(h.botService)
+	}
 
 	// If a session was restored from MongoDB, auto-reconnect in the background
 	// so users don't need to manually re-init after a server restart / PM2 reload.
@@ -376,11 +437,19 @@ func (h *WhatsAppHandler) SendMessages(w http.ResponseWriter, r *http.Request) {
 		messages = []types.Message{req.Message}
 	}
 
-	// Verify all uploaded image files exist and schedule cleanup
+	// Verify all uploaded image files exist, enforce ownership, and schedule cleanup
 	var imagePaths []string
 	for _, msg := range messages {
 		if msg.ImagePath == "" {
 			continue
+		}
+		// Reject any path that doesn't belong to this user (path traversal / cross-user access)
+		if h.imageHandler != nil && !h.imageHandler.IsOwnedBy(msg.ImagePath, userID) {
+			logger.Error("ISOLATION: user %s tried to send image owned by another user: %s", userID, msg.ImagePath)
+			data, _ := json.Marshal(types.ProgressUpdate{Type: "error", Data: "Image access denied"})
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+			return
 		}
 		info, err := os.Stat(msg.ImagePath)
 		if err != nil {
@@ -476,6 +545,82 @@ func (h *WhatsAppHandler) SendMessages(w http.ResponseWriter, r *http.Request) {
 	data, _ := json.Marshal(types.ProgressUpdate{Type: "complete", Data: progress})
 	fmt.Fprintf(w, "data: %s\n\n", data)
 	flusher.Flush()
+}
+
+// GetContacts returns all contacts from the user's active WhatsApp session store.
+func (h *WhatsAppHandler) GetContacts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID, ok := middleware.GetUserID(r)
+	if !ok {
+		respondError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	waService, err := h.getOrCreateService(userID)
+	if err != nil {
+		respondError(w, fmt.Sprintf("Failed to get session: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	contacts, err := waService.GetWhatsAppContacts(r.Context())
+	if err != nil {
+		respondError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	respondJSON(w, types.APIResponse{
+		Success: true,
+		Data:    contacts,
+	})
+}
+
+// AutoStartBotSessions queries MongoDB for all users with an enabled bot config
+// and auto-initializes their WhatsApp sessions so the bot starts listening
+// immediately on server start — without requiring the user to open the web panel.
+func (h *WhatsAppHandler) AutoStartBotSessions(ctx context.Context) {
+	if h.db == nil {
+		return
+	}
+
+	type botConfigMinimal struct {
+		UserID    primitive.ObjectID `bson:"user_id"`
+		IsEnabled bool               `bson:"is_enabled"`
+	}
+
+	cursor, err := h.db.BotConfigs().Find(ctx, bson.M{"is_enabled": true})
+	if err != nil {
+		logger.Warn("AutoStartBotSessions: failed to query bot_configs: %v", err)
+		return
+	}
+	defer cursor.Close(ctx)
+
+	var configs []botConfigMinimal
+	if err := cursor.All(ctx, &configs); err != nil {
+		logger.Warn("AutoStartBotSessions: failed to decode bot_configs: %v", err)
+		return
+	}
+
+	if len(configs) == 0 {
+		logger.Info("AutoStartBotSessions: no active bot sessions to restore")
+		return
+	}
+
+	logger.Info("AutoStartBotSessions: restoring %d bot session(s)...", len(configs))
+	for _, cfg := range configs {
+		userID := cfg.UserID.Hex()
+		go func(uid string) {
+			_, err := h.getOrCreateService(uid)
+			if err != nil {
+				logger.Warn("AutoStartBotSessions: failed to init session for user %s: %v", uid, err)
+			} else {
+				logger.Info("AutoStartBotSessions: session initialized for user %s", uid)
+			}
+		}(userID)
+	}
 }
 
 func respondJSON(w http.ResponseWriter, data interface{}) {

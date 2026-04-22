@@ -1,23 +1,27 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"math/rand"
 	"net/http"
 	"strings"
 	"time"
 
+	appdb "github.com/JASIM0021/bulk-whatsapp-send/backend/internal/db"
 	"github.com/JASIM0021/bulk-whatsapp-send/backend/internal/middleware"
 	"github.com/JASIM0021/bulk-whatsapp-send/backend/internal/types"
 )
 
 // ExternalAPIHandler handles developer API endpoints (API-key-authenticated, JSON responses).
 type ExternalAPIHandler struct {
-	whatsappHandler *WhatsAppHandler
+	whatsappHandler  *WhatsAppHandler
+	schedulerHandler *SchedulerHandler
+	db               *appdb.DB
 }
 
-func NewExternalAPIHandler(wh *WhatsAppHandler) *ExternalAPIHandler {
-	return &ExternalAPIHandler{whatsappHandler: wh}
+func NewExternalAPIHandler(wh *WhatsAppHandler, sh *SchedulerHandler, db *appdb.DB) *ExternalAPIHandler {
+	return &ExternalAPIHandler{whatsappHandler: wh, schedulerHandler: sh, db: db}
 }
 
 // POST /api/v1/send
@@ -67,7 +71,45 @@ func (h *ExternalAPIHandler) Send(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get the user's WhatsApp service (read-only — do NOT auto-init)
+	// ── Scheduled send ──────────────────────────────────────────────────────────
+	if req.ScheduleAt != "" {
+		scheduledAt, err := time.Parse(time.RFC3339, req.ScheduleAt)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "error": "invalid schedule_at format — use ISO 8601 (e.g. 2024-01-15T14:30:00Z)"})
+			return
+		}
+		if scheduledAt.Before(time.Now().UTC().Add(30 * time.Second)) {
+			writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "error": "schedule_at must be at least 30 seconds in the future"})
+			return
+		}
+
+		// Build types.Contact slice
+		typeContacts := make([]types.Contact, len(contacts))
+		for i, c := range contacts {
+			typeContacts[i] = types.Contact{Phone: c.Phone, Name: c.Name}
+		}
+		typeMessages := []types.Message{{Text: req.Message.Text, ImageURL: req.Message.ImageURL}}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+
+		job, err := h.schedulerHandler.CreateJob(ctx, userID, typeContacts, typeMessages, scheduledAt, "")
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "error": "failed to schedule job"})
+			return
+		}
+
+		writeJSON(w, http.StatusAccepted, map[string]interface{}{
+			"success":      true,
+			"scheduled":    true,
+			"job_id":       job.ID,
+			"scheduled_at": scheduledAt.UTC().Format(time.RFC3339),
+			"total":        len(contacts),
+		})
+		return
+	}
+
+	// ── Immediate send ──────────────────────────────────────────────────────────
 	waService, found := h.whatsappHandler.GetServiceForUser(userID)
 	if !found || !waService.IsReady() {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{

@@ -1,5 +1,7 @@
 package types
 
+import "time"
+
 // Contact represents a contact with phone number and name
 type Contact struct {
 	Phone string `json:"phone"`
@@ -354,6 +356,7 @@ type ExternalSendRequest struct {
 		Text     string `json:"text"`
 		ImageURL string `json:"imageUrl,omitempty"`
 	} `json:"message"`
+	ScheduleAt string `json:"schedule_at,omitempty"` // optional ISO 8601 — if set, schedules instead of sending now
 }
 
 // ExternalSendResponse is the JSON response from POST /api/v1/send
@@ -363,4 +366,90 @@ type ExternalSendResponse struct {
 	Failed  int      `json:"failed"`
 	Total   int      `json:"total"`
 	Errors  []string `json:"errors,omitempty"`
+}
+
+// ScheduledJobStatus constants
+const (
+	JobStatusPending   = "pending"
+	JobStatusRunning   = "running"
+	JobStatusDone      = "done"
+	JobStatusFailed    = "failed"
+	JobStatusCancelled = "cancelled"
+)
+
+// ScheduledJobResult holds the outcome of a completed scheduled job.
+type ScheduledJobResult struct {
+	Sent   int      `bson:"sent"   json:"sent"`
+	Failed int      `bson:"failed" json:"failed"`
+	Total  int      `bson:"total"  json:"total"`
+	Errors []string `bson:"errors" json:"errors"`
+}
+
+// ScheduledJob is a message-send job queued for a future time.
+type ScheduledJob struct {
+	ID          string              `bson:"_id,omitempty"          json:"id"`
+	UserID      string              `bson:"user_id"                json:"userId"`
+	Contacts    []Contact           `bson:"contacts"               json:"contacts"`
+	Messages    []Message           `bson:"messages"               json:"messages"`
+	ScheduledAt time.Time           `bson:"scheduled_at"           json:"scheduledAt"`
+	Status      string              `bson:"status"                 json:"status"`
+	Label       string              `bson:"label,omitempty"        json:"label,omitempty"`
+	CreatedAt   time.Time           `bson:"created_at"             json:"createdAt"`
+	CompletedAt *time.Time          `bson:"completed_at,omitempty" json:"completedAt,omitempty"`
+	Result      *ScheduledJobResult `bson:"result,omitempty"       json:"result,omitempty"`
+	ErrorMsg    string              `bson:"error_msg,omitempty"    json:"errorMsg,omitempty"`
+}
+
+// ScheduleRequest is the body for POST /api/schedule (internal JWT API).
+type ScheduleRequest struct {
+	Contacts    []Contact `json:"contacts"`
+	Messages    []Message `json:"messages"`
+	ScheduledAt string    `json:"scheduledAt"` // ISO 8601 datetime string
+	Label       string    `json:"label,omitempty"`
+}
+
+// BotConfig stores a user's WhatsApp chatbot configuration.
+type BotConfig struct {
+	ID           string   `bson:"_id,omitempty"        json:"id"`
+	UserID       string   `bson:"user_id"              json:"userId"`
+	BusinessName string   `bson:"business_name"        json:"businessName"`
+	Description  string   `bson:"description"          json:"description"`
+	Website      string   `bson:"website,omitempty"    json:"website,omitempty"`
+	Services     []string `bson:"services"             json:"services"`
+	BookingLink  string   `bson:"booking_link,omitempty" json:"bookingLink,omitempty"`
+	ProductLink  string   `bson:"product_link,omitempty" json:"productLink,omitempty"`
+	IsEnabled    bool     `bson:"is_enabled"           json:"isEnabled"`
+	CreatedAt    string   `bson:"created_at"           json:"createdAt"`
+	UpdatedAt    string   `bson:"updated_at"           json:"updatedAt"`
+}
+
+// UpsertBotConfigRequest is the request body for POST/PUT /api/bot
+type UpsertBotConfigRequest struct {
+	BusinessName string   `json:"businessName"`
+	Description  string   `json:"description"`
+	Website      string   `json:"website,omitempty"`
+	Services     []string `json:"services"`
+	BookingLink  string   `json:"bookingLink,omitempty"`
+	ProductLink  string   `json:"productLink,omitempty"`
+	IsEnabled    bool     `json:"isEnabled"`
+}
+
+// ChatMessage is a single turn in a bot conversation.
+type ChatMessage struct {
+	Role    string `bson:"role"    json:"role"`    // "user" or "model"
+	Content string `bson:"content" json:"content"`
+}
+
+// ChatHistory stores conversation history for a bot session.
+type ChatHistory struct {
+	UserID       string        `bson:"user_id"`
+	ContactPhone string        `bson:"contact_phone"`
+	Messages     []ChatMessage `bson:"messages"`
+	UpdatedAt    string        `bson:"updated_at"`
+}
+
+// UpdateUserPlanRequest is the request body for admin plan update endpoint.
+type UpdateUserPlanRequest struct {
+	Plan       string `json:"plan"`       // "free" | "monthly" | "yearly"
+	DaysToAdd  int    `json:"daysToAdd"`  // extend from now by N days (0 = use plan default)
 }

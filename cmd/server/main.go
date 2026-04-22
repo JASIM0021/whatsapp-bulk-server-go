@@ -106,7 +106,12 @@ func main() {
 	contactsHandler := handler.NewContactsHandler(appDB)
 	apiKeyService := service.NewAPIKeyService(appDB, subscriptionService)
 	apiKeyHandler := handler.NewAPIKeyHandler(apiKeyService)
-	externalHandler := handler.NewExternalAPIHandler(whatsappHandler)
+	schedulerHandler := handler.NewSchedulerHandler(appDB, whatsappHandler, subscriptionService)
+	externalHandler := handler.NewExternalAPIHandler(whatsappHandler, schedulerHandler, appDB)
+	botService := service.NewBotService(appDB, subscriptionService)
+	botHandler := handler.NewBotHandler(botService)
+	whatsappHandler.SetBotService(botService)
+	whatsappHandler.SetImageHandler(imageHandler)
 
 	// Auth middleware helper
 	authMiddleware := middleware.Auth(authService)
@@ -160,6 +165,7 @@ func main() {
 	mux.Handle("/api/whatsapp/status", wrap(whatsappHandler.GetStatus)) // status check doesn't need subscription
 	mux.Handle("/api/whatsapp/disconnect", wrap(whatsappHandler.Disconnect)) // allow disconnect always
 	mux.Handle("/api/whatsapp/send", wrapSub(whatsappHandler.SendMessages))
+	mux.Handle("/api/whatsapp/contacts", wrap(whatsappHandler.GetContacts))
 	mux.Handle("/api/upload", wrapSub(uploadHandler.UploadFile))
 	mux.Handle("/api/upload/image", wrapSub(imageHandler.UploadImage))
 	mux.Handle("/api/templates", wrapSub(templateHandler.HandleCollection))
@@ -168,6 +174,13 @@ func main() {
 	// Contacts book (auth only — no subscription gate)
 	mux.Handle("/api/contacts", wrap(contactsHandler.HandleCollection))
 	mux.Handle("/api/contacts/", wrap(contactsHandler.HandleSingle))
+
+	// Scheduled jobs (auth + subscription required)
+	mux.Handle("/api/schedule", wrapSub(schedulerHandler.HandleCollection))
+	mux.Handle("/api/schedule/", wrapSub(schedulerHandler.HandleSingle))
+
+	// Bot config (auth + yearly subscription — plan check is inside the service)
+	mux.Handle("/api/bot", wrap(botHandler.HandleBot))
 
 	// API key management (JWT auth — no subscription gate so users can view/revoke after expiry)
 	mux.Handle("/api/apikeys", wrap(func(w http.ResponseWriter, r *http.Request) {
@@ -190,6 +203,8 @@ func main() {
 
 	// External developer API (API-key auth, not JWT)
 	mux.Handle("/api/v1/send", wrapAPIKey(externalHandler.Send))
+	mux.Handle("/api/v1/schedules", wrapAPIKey(schedulerHandler.HandleExternalList))
+	mux.Handle("/api/v1/schedules/", wrapAPIKey(schedulerHandler.HandleExternalCancel))
 
 	// Admin routes (auth + admin role required)
 	adminMiddleware := middleware.AdminOnly(appDB.MongoDB())
@@ -210,6 +225,10 @@ func main() {
 	mux.Handle("/api/admin/users/", wrapAdmin(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/activity") && r.Method == http.MethodGet {
 			adminHandler.GetUserActivity(w, r)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/plan") && r.Method == http.MethodPut {
+			adminHandler.UpdateUserPlan(w, r)
 			return
 		}
 		switch r.Method {
@@ -315,6 +334,14 @@ func main() {
 		WriteTimeout: 0, // No write timeout for SSE streaming
 		IdleTimeout:  120 * time.Second,
 	}
+
+	// Start background scheduler
+	schedulerHandler.Start()
+
+	// Auto-start WhatsApp sessions for users who have the bot enabled,
+	// so the bot begins listening immediately on server start without
+	// requiring the user to open the web panel.
+	go whatsappHandler.AutoStartBotSessions(context.Background())
 
 	go func() {
 		logger.Section("SERVER STARTED")

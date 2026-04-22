@@ -156,6 +156,30 @@ func (d *DB) EnsureIndexes(ctx context.Context) error {
 	_, err = d.APIKeys().Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys: bson.D{{Key: "user_id", Value: 1}},
 	})
+	if err != nil {
+		return err
+	}
+	// Scheduled jobs indexes
+	_, err = d.ScheduledJobs().Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "user_id", Value: 1}, {Key: "status", Value: 1}, {Key: "scheduled_at", Value: 1}}},
+		{Keys: bson.D{{Key: "status", Value: 1}, {Key: "scheduled_at", Value: 1}}},
+	})
+	if err != nil {
+		return err
+	}
+	// Bot configs: one config per user
+	_, err = d.BotConfigs().Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "user_id", Value: 1}},
+		Options: options.Index().SetUnique(true),
+	})
+	if err != nil {
+		return err
+	}
+	// Chat history: one history per (user, contact)
+	_, err = d.ChatHistory().Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "user_id", Value: 1}, {Key: "contact_phone", Value: 1}},
+		Options: options.Index().SetUnique(true),
+	})
 	return err
 }
 
@@ -172,6 +196,9 @@ func (d *DB) Invoices() *mongo.Collection      { return d.mdb.Collection("invoic
 func (d *DB) PlanConfigs() *mongo.Collection   { return d.mdb.Collection("plan_configs") }
 func (d *DB) PromoCodes() *mongo.Collection    { return d.mdb.Collection("promo_codes") }
 func (d *DB) APIKeys() *mongo.Collection       { return d.mdb.Collection("api_keys") }
+func (d *DB) ScheduledJobs() *mongo.Collection { return d.mdb.Collection("scheduled_jobs") }
+func (d *DB) BotConfigs() *mongo.Collection    { return d.mdb.Collection("bot_configs") }
+func (d *DB) ChatHistory() *mongo.Collection   { return d.mdb.Collection("chat_history") }
 
 func (d *DB) Close(ctx context.Context) error {
 	return d.client.Disconnect(ctx)

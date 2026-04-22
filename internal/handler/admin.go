@@ -1008,3 +1008,81 @@ func (h *AdminHandler) GetUserActivity(w http.ResponseWriter, r *http.Request) {
 		},
 	})
 }
+
+// UpdateUserPlan manually sets a user's subscription plan.
+// PUT /api/admin/users/{id}/plan
+func (h *AdminHandler) UpdateUserPlan(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		respondError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract user ID from path: /api/admin/users/{id}/plan
+	path := r.URL.Path
+	path = strings.TrimSuffix(path, "/plan")
+	userID := extractUserIDFromPath(path)
+	if userID == "" {
+		respondError(w, "User ID is required", http.StatusBadRequest)
+		return
+	}
+
+	var req types.UpdateUserPlanRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Plan != "free" && req.Plan != "monthly" && req.Plan != "yearly" {
+		respondError(w, "plan must be free, monthly, or yearly", http.StatusBadRequest)
+		return
+	}
+
+	oid, err := primitive.ObjectIDFromHex(userID)
+	if err != nil {
+		respondError(w, "Invalid user ID", http.StatusBadRequest)
+		return
+	}
+
+	daysToAdd := req.DaysToAdd
+	if daysToAdd <= 0 {
+		switch req.Plan {
+		case "free":
+			daysToAdd = 7
+		case "monthly":
+			daysToAdd = 30
+		case "yearly":
+			daysToAdd = 365
+		}
+	}
+
+	now := time.Now()
+	expiry := now.Add(time.Duration(daysToAdd) * 24 * time.Hour)
+
+	ctx := r.Context()
+	update := bson.M{
+		"$set": bson.M{
+			"plan":          req.Plan,
+			"status":        "active",
+			"start_date":    now,
+			"expiry_date":   expiry,
+			"messages_used": 0,
+		},
+	}
+	result, err := h.db.Collection("subscriptions").UpdateOne(ctx, bson.M{"user_id": oid}, update)
+	if err != nil {
+		respondError(w, "Failed to update subscription", http.StatusInternalServerError)
+		return
+	}
+	if result.MatchedCount == 0 {
+		respondError(w, "User subscription not found", http.StatusNotFound)
+		return
+	}
+
+	respondJSON(w, map[string]interface{}{
+		"success": true,
+		"message": "User plan updated successfully",
+		"data": map[string]interface{}{
+			"plan":       req.Plan,
+			"expiryDate": expiry.Format("2006-01-02"),
+		},
+	})
+}

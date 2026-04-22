@@ -4,5 +4,9 @@
       "Bash(go run:*)",
       "Bash(go build:*)"
     ]
-  }
+  },
+  "enabledMcpjsonServers": [
+    "shadcn"
+  ],
+  "enableAllProjectMcpServers": true
 }

@@ -11,10 +11,13 @@ import (
 	"time"
 
 	"github.com/JASIM0021/bulk-whatsapp-send/backend/internal/logger"
+	"github.com/JASIM0021/bulk-whatsapp-send/backend/internal/middleware"
 	"github.com/JASIM0021/bulk-whatsapp-send/backend/internal/types"
 )
 
 type ImageHandler struct {
+	// uploadDir is the base images directory (uploads/images).
+	// Actual files go into uploadDir/<userID>/ to enforce isolation.
 	uploadDir string
 	maxSize   int64
 }
@@ -25,7 +28,7 @@ func NewImageHandler() *ImageHandler {
 		uploadDir = "./uploads"
 	}
 
-	// Create images subdirectory
+	// Create base images subdirectory; per-user dirs are created on demand.
 	imagesDir := filepath.Join(uploadDir, "images")
 	if err := os.MkdirAll(imagesDir, 0755); err != nil {
 		logger.Error("Failed to create images directory: %v", err)
@@ -38,13 +41,32 @@ func NewImageHandler() *ImageHandler {
 	}
 }
 
+// UserUploadDir returns the absolute, cleaned upload directory for a given user.
+// Callers can use this to validate that a given path belongs to the user.
+func (h *ImageHandler) UserUploadDir(userID string) string {
+	return filepath.Clean(filepath.Join(h.uploadDir, userID))
+}
+
+// IsOwnedBy returns true when filePath is inside the user's upload directory.
+func (h *ImageHandler) IsOwnedBy(filePath, userID string) bool {
+	userDir := h.UserUploadDir(userID) + string(filepath.Separator)
+	clean := filepath.Clean(filePath)
+	return strings.HasPrefix(clean+string(filepath.Separator), userDir)
+}
+
 func (h *ImageHandler) UploadImage(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		respondError(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	logger.Info("Received image upload request")
+	userID, ok := middleware.GetUserID(r)
+	if !ok || userID == "" {
+		respondError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	logger.Info("Received image upload request from user=%s", userID)
 
 	// Parse multipart form (max 10MB in memory)
 	err := r.ParseMultipartForm(h.maxSize)
@@ -80,13 +102,21 @@ func (h *ImageHandler) UploadImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate unique filename
+	// Create per-user upload directory
+	userDir := h.UserUploadDir(userID)
+	if err := os.MkdirAll(userDir, 0755); err != nil {
+		logger.Error("Failed to create user upload dir: %v", err)
+		respondError(w, "Failed to save image", http.StatusInternalServerError)
+		return
+	}
+
+	// Generate unique filename inside the user's directory
 	ext := filepath.Ext(header.Filename)
 	if ext == "" {
 		ext = getExtensionFromMimeType(contentType)
 	}
 	filename := fmt.Sprintf("img_%d%s", time.Now().UnixNano(), ext)
-	filepath := filepath.Join(h.uploadDir, filename)
+	filepath := filepath.Join(userDir, filename)
 
 	// Create destination file
 	dst, err := os.Create(filepath)

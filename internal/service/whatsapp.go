@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"database/sql"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -31,12 +30,14 @@ import (
 	"github.com/JASIM0021/bulk-whatsapp-send/backend/internal/logger"
 )
 
-// waSessionDoc is the MongoDB document that stores a user's WhatsApp session.
+// waSessionDoc is the MongoDB document that stores a user's WhatsApp session identity.
+// Only the JID (device ID) is stored here; the actual crypto session lives in the
+// shared SQLite container managed by sqlstore.
 type waSessionDoc struct {
-	UserID      string    `bson:"user_id"`
-	SessionData []byte    `bson:"session_data"` // SQLite file bytes (base64-unencoded binary)
-	WAPhone     string    `bson:"wa_phone"`
-	UpdatedAt   time.Time `bson:"updated_at"`
+	UserID    string    `bson:"user_id"`
+	WAJID     string    `bson:"wa_jid"`   // full JID string, e.g. "919062955974:15@s.whatsapp.net"
+	WAPhone   string    `bson:"wa_phone"` // human-readable phone number
+	UpdatedAt time.Time `bson:"updated_at"`
 }
 
 type WhatsAppService struct {
@@ -50,11 +51,15 @@ type WhatsAppService struct {
 	lastQR         string
 
 	// session persistence
-	db                  *db.DB
-	userID              string
-	dbPath              string // path to the temp SQLite file
-	stopSync            chan struct{}
-	hadRestoredSession  bool // true when a session was loaded from MongoDB on startup
+	db                 *db.DB
+	userID             string
+	stopSync           chan struct{}
+	hadRestoredSession bool // true when the user's JID was found in the shared container on startup
+
+	// bot support
+	botService interface {
+		HandleIncomingMessage(ctx context.Context, userID, senderPhone, messageText string, waReply func(phone, text string) error)
+	}
 }
 
 func NewWhatsAppService() (*WhatsAppService, error) {
@@ -71,114 +76,113 @@ func init() {
 }
 
 func NewWhatsAppServiceWithPath(dbPath, userID string, database *db.DB) (*WhatsAppService, error) {
-	svc := &WhatsAppService{
-		qrChan:         make(chan string, 10),
-		readyChan:      make(chan bool, 10),
-		disconnectChan: make(chan string, 10),
-		stopSync:       make(chan struct{}),
-		db:             database,
-		userID:         userID,
-		dbPath:         dbPath,
-	}
-
-	// If MongoDB is available, try to restore the session from it.
-	if database != nil && userID != "" {
-		if err := svc.restoreFromMongo(context.Background()); err != nil {
-			logger.Warn("Could not restore session from MongoDB for user %s: %v", userID, err)
-		}
-	}
-
 	dbLog := waLog.Stdout("Database", "ERROR", true)
 	container, err := sqlstore.New(context.Background(), "sqlite3",
 		fmt.Sprintf("file:%s?_foreign_keys=on", dbPath), dbLog)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create database: %w", err)
 	}
-	svc.container = container
+	return NewWhatsAppServiceWithContainer(container, userID, database)
+}
+
+// SharedContainer is a type alias for *sqlstore.Container.
+// Exposed so callers (e.g. handlers) don't need to import whatsmeow/store/sqlstore directly.
+type SharedContainer = *sqlstore.Container
+
+// NewSharedContainer opens (or creates) a single SQLite database to hold all users'
+// WhatsApp session data. Pass the returned container to NewWhatsAppServiceWithContainer.
+// One container for all users = one file on disk regardless of user count.
+func NewSharedContainer(dbPath string) (SharedContainer, error) {
+	dbLog := waLog.Stdout("SharedWADB", "ERROR", true)
+	return sqlstore.New(context.Background(), "sqlite3",
+		fmt.Sprintf("file:%s?_foreign_keys=on", dbPath), dbLog)
+}
+
+// NewWhatsAppServiceWithContainer creates a WhatsApp service that shares a single
+// sqlstore.Container across all users. Each user's session is identified by their
+// WhatsApp JID stored in MongoDB — no per-user SQLite files are created.
+func NewWhatsAppServiceWithContainer(container SharedContainer, userID string, database *db.DB) (*WhatsAppService, error) {
+	svc := &WhatsAppService{
+		qrChan:         make(chan string, 10),
+		readyChan:      make(chan bool, 10),
+		disconnectChan: make(chan string, 10),
+		stopSync:       make(chan struct{}),
+		container:      container,
+		db:             database,
+		userID:         userID,
+	}
+	// If MongoDB records a JID for this user, and that device exists in the shared
+	// container, mark the session as restorable so the handler auto-reconnects.
+	if database != nil && userID != "" {
+		if svc.findDeviceByStoredJID() != nil {
+			svc.hadRestoredSession = true
+		}
+	}
 	return svc, nil
 }
 
-// restoreFromMongo loads the SQLite session bytes from MongoDB and writes them to dbPath.
-func (s *WhatsAppService) restoreFromMongo(ctx context.Context) error {
-	var doc waSessionDoc
-	err := s.db.WASessions().FindOne(ctx, bson.M{"user_id": s.userID}).Decode(&doc)
-	if err != nil {
-		return nil // no session stored yet — not an error
+// loadJIDFromMongo returns the WhatsApp JID string stored for this user, or "" if none.
+func (s *WhatsAppService) loadJIDFromMongo(ctx context.Context) string {
+	if s.db == nil || s.userID == "" {
+		return ""
 	}
-	if len(doc.SessionData) == 0 {
+	var doc waSessionDoc
+	if err := s.db.WASessions().FindOne(ctx, bson.M{"user_id": s.userID}).Decode(&doc); err != nil {
+		return ""
+	}
+	return doc.WAJID
+}
+
+// findDeviceByStoredJID looks up the user's JID in MongoDB then finds the matching
+// device in the shared sqlstore container. Returns nil if not found.
+func (s *WhatsAppService) findDeviceByStoredJID() *store.Device {
+	jid := s.loadJIDFromMongo(context.Background())
+	if jid == "" {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(s.dbPath), 0755); err != nil {
-		return err
+	devices, err := s.container.GetAllDevices(context.Background())
+	if err != nil {
+		return nil
 	}
-	logger.Info("Restoring WhatsApp session from MongoDB for user %s", s.userID)
-	if err := os.WriteFile(s.dbPath, doc.SessionData, 0600); err != nil {
-		return err
+	for _, d := range devices {
+		if d.ID != nil && d.ID.String() == jid {
+			return d
+		}
 	}
-	s.hadRestoredSession = true
 	return nil
 }
 
-// syncToMongo reads the current SQLite file and saves it to MongoDB.
-func (s *WhatsAppService) syncToMongo(waPhone string) {
+// saveJIDToMongo persists the user's WhatsApp JID to MongoDB.
+// Called once after a successful QR scan; the JID never changes after that.
+func (s *WhatsAppService) saveJIDToMongo(waJID, waPhone string) {
 	if s.db == nil || s.userID == "" {
 		return
 	}
-
-	// Checkpoint WAL so the main db file is up-to-date before we read it.
-	sqlDB, err := sql.Open("sqlite3", fmt.Sprintf("file:%s?_foreign_keys=on", s.dbPath))
-	if err == nil {
-		sqlDB.Exec("PRAGMA wal_checkpoint(FULL)") //nolint
-		sqlDB.Close()
-	}
-
-	data, err := os.ReadFile(s.dbPath)
-	if err != nil {
-		logger.Warn("syncToMongo: could not read session file: %v", err)
-		return
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
 	doc := waSessionDoc{
-		UserID:      s.userID,
-		SessionData: data,
-		WAPhone:     waPhone,
-		UpdatedAt:   time.Now(),
+		UserID:    s.userID,
+		WAJID:     waJID,
+		WAPhone:   waPhone,
+		UpdatedAt: time.Now(),
 	}
-	opts := options.Replace().SetUpsert(true)
-	_, err = s.db.WASessions().ReplaceOne(ctx, bson.M{"user_id": s.userID}, doc, opts)
+	_, err := s.db.WASessions().ReplaceOne(ctx, bson.M{"user_id": s.userID}, doc,
+		options.Replace().SetUpsert(true))
 	if err != nil {
-		logger.Warn("syncToMongo: could not save session to MongoDB: %v", err)
+		logger.Warn("saveJIDToMongo: %v", err)
 		return
 	}
-	logger.Info("WhatsApp session synced to MongoDB for user %s", s.userID)
+	logger.Info("WhatsApp JID saved to MongoDB for user %s (%s)", s.userID, waPhone)
 }
 
-// startPeriodicSync syncs the session to MongoDB every 2 minutes while connected.
-func (s *WhatsAppService) startPeriodicSync() {
-	ticker := time.NewTicker(2 * time.Minute)
-	go func() {
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				s.mu.RLock()
-				waPhone := ""
-				if s.client != nil && s.client.Store.ID != nil {
-					waPhone = s.client.Store.ID.String()
-				}
-				connected := s.client != nil && s.client.IsConnected()
-				s.mu.RUnlock()
-				if connected {
-					s.syncToMongo(waPhone)
-				}
-			case <-s.stopSync:
-				return
-			}
-		}
-	}()
+// clearJIDFromMongo removes the stored JID for this user (called when a session goes stale).
+func (s *WhatsAppService) clearJIDFromMongo() {
+	if s.db == nil || s.userID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, _ = s.db.WASessions().DeleteOne(ctx, bson.M{"user_id": s.userID})
 }
 
 func (s *WhatsAppService) Initialize() error {
@@ -204,13 +208,11 @@ func (s *WhatsAppService) Initialize() error {
 
 	logger.Info("Initializing WhatsApp client...")
 
-	deviceStore, err := s.container.GetFirstDevice(context.Background())
-	if err != nil {
-		logger.Error("Failed to get device from store: %v", err)
-		return fmt.Errorf("failed to get device: %w", err)
-	}
+	// Look up the user's device in the shared container by their stored JID.
+	// Returns nil for first-time logins (no JID stored yet).
+	deviceStore := s.findDeviceByStoredJID()
+	hasSession := deviceStore != nil
 
-	hasSession := deviceStore.ID != nil
 	if hasSession {
 		logger.Info("Found existing session (Device ID: *****%s)",
 			deviceStore.ID.String()[max(0, len(deviceStore.ID.String())-8):])
@@ -227,12 +229,11 @@ func (s *WhatsAppService) Initialize() error {
 		logger.Info("Reconnecting with existing session...")
 		if err := s.client.Connect(); err != nil {
 			logger.Error("Failed to connect with existing session: %v", err)
-			// Session is stale — delete it and fall through to QR generation
+			// Session is stale — remove from container and MongoDB, then re-QR
 			logger.Info("Deleting stale session and generating new QR code...")
 			s.client.Disconnect()
-			if deviceStore.ID != nil {
-				_ = deviceStore.Delete(context.Background())
-			}
+			_ = deviceStore.Delete(context.Background())
+			go s.clearJIDFromMongo()
 			s.client = nil
 			s.isReady = false
 			return s.initWithQRCodeLocked()
@@ -251,18 +252,16 @@ func (s *WhatsAppService) Initialize() error {
 
 		if connected && s.isReady {
 			logger.Success("Reconnected with existing session!")
-			// Re-send ready signal for any listeners
 			select {
 			case s.readyChan <- true:
 			default:
 			}
 		} else {
-			// Session could not reconnect — delete stale session and generate QR
+			// Session could not reconnect — clear and re-QR
 			logger.Warn("Existing session could not reconnect — clearing and generating QR code")
 			s.client.Disconnect()
-			if deviceStore.ID != nil {
-				_ = deviceStore.Delete(context.Background())
-			}
+			_ = deviceStore.Delete(context.Background())
+			go s.clearJIDFromMongo()
 			s.client = nil
 			s.isReady = false
 			s.lastQR = ""
@@ -278,10 +277,10 @@ func (s *WhatsAppService) Initialize() error {
 // initWithQRCodeLocked creates a fresh client and starts QR code generation.
 // Must be called with s.mu held.
 func (s *WhatsAppService) initWithQRCodeLocked() error {
-	deviceStore, err := s.container.GetFirstDevice(context.Background())
-	if err != nil {
-		return fmt.Errorf("failed to get device: %w", err)
-	}
+	// NewDevice creates an empty in-memory device backed by the shared container.
+	// It gets a real JID (and is saved to the container's SQLite) only after the
+	// user scans the QR code and WhatsApp assigns a device ID.
+	deviceStore := s.container.NewDevice()
 
 	clientLog := waLog.Stdout("WhatsApp", "ERROR", true)
 	s.client = whatsmeow.NewClient(deviceStore, clientLog)
@@ -357,7 +356,8 @@ func (s *WhatsAppService) handleEvents(evt interface{}) {
 		if s.client.Store.ID != nil {
 			s.mu.Lock()
 			s.isReady = true
-			waPhone := s.client.Store.ID.String()
+			waJID := s.client.Store.ID.String()
+			waPhone := "+" + s.client.Store.ID.User
 			s.mu.Unlock()
 
 			logger.Success("WhatsApp connected! Phone: %s", waPhone)
@@ -367,9 +367,9 @@ func (s *WhatsAppService) handleEvents(evt interface{}) {
 			default:
 			}
 
-			// Persist session to MongoDB and start periodic sync
-			go s.syncToMongo(waPhone)
-			go s.startPeriodicSync()
+			// Persist the JID to MongoDB so we can reconnect after server restart.
+			// The actual session crypto is already in the shared SQLite container.
+			go s.saveJIDToMongo(waJID, waPhone)
 		}
 
 	case *events.Disconnected:
@@ -406,7 +406,173 @@ func (s *WhatsAppService) handleEvents(evt interface{}) {
 
 	case *events.TemporaryBan:
 		logger.Warn("WhatsApp temporary ban (code: %v)", v.Code)
+
+	case *events.Message:
+		// Skip our own outgoing messages, group chats, and broadcast/status updates
+		if v.Info.IsFromMe || v.Info.IsGroup || v.Info.Chat.Server == "broadcast" {
+			return
+		}
+		text := strings.TrimSpace(extractMessageText(v.Message))
+		if text == "" {
+			return // media, sticker, reaction, etc. — nothing to reply to
+		}
+		// WhatsApp uses two addressing modes:
+		//   - PN (phone number): Sender.User contains the real phone number
+		//   - LID (Long-term ID): Sender.User contains an internal ID, NOT a phone.
+		//     The real phone is in SenderAlt.User when available.
+		// Skip LID addresses with no phone fallback to avoid processing bot/automated messages.
+		if v.Info.AddressingMode == types.AddressingModeLID && v.Info.SenderAlt.User == "" {
+			return
+		}
+		senderUser := v.Info.Sender.User
+		if v.Info.AddressingMode == types.AddressingModeLID && v.Info.SenderAlt.User != "" {
+			senderUser = v.Info.SenderAlt.User
+		}
+		if senderUser == "" {
+			return
+		}
+		// senderPhone := "+" + senderUser
+		senderPhone, ok := ExtractSenderPhone(&v.Info)
+		if !ok {
+			return
+		}
+		logger.Info("Bot: incoming message from %s → %q", senderPhone, text)
+
+		s.mu.RLock()
+		botSvc := s.botService
+		userID := s.userID
+		s.mu.RUnlock()
+
+		if botSvc == nil {
+			logger.Info("Bot: no bot service injected for user %s — skipping", userID)
+			return
+		}
+		if userID == "" {
+			logger.Info("Bot: WhatsApp service has no userID — skipping")
+			return
+		}
+		go botSvc.HandleIncomingMessage(
+			context.Background(),
+			userID,
+			senderPhone,
+			text,
+			func(phone, reply string) error {
+				return s.SendMessage(phone, reply)
+			},
+		)
 	}
+}
+
+func ExtractSenderPhone(info *types.MessageInfo) (string, bool) {
+	if info == nil {
+		return "", false
+	}
+
+	// Skip invalid/system messages
+	if info.IsFromMe || info.Chat.Server == "broadcast" {
+		return "", false
+	}
+
+	var candidates []string
+
+	// 1. Highest priority: SenderAlt (real phone in LID mode)
+	if info.SenderAlt.User != "" {
+		candidates = append(candidates, info.SenderAlt.User)
+	}
+
+	// 2. Chat user (VERY important for 1:1 LID messages)
+	if info.Chat.User != "" {
+		candidates = append(candidates, info.Chat.User)
+	}
+
+	// 3. Sender (PN mode OR fallback)
+	if info.Sender.User != "" {
+		candidates = append(candidates, info.Sender.User)
+	}
+
+	// Try to extract a valid phone from candidates
+	for _, user := range candidates {
+		phone := normalizePhone(user)
+		if isValidPhone(phone) {
+			return phone, true
+		}
+	}
+
+	return "", false
+}
+
+func normalizePhone(user string) string {
+	// Remove domain if present
+	user = strings.Split(user, "@")[0]
+
+	// Keep only digits
+	clean := ""
+	for _, ch := range user {
+		if ch >= '0' && ch <= '9' {
+			clean += string(ch)
+		}
+	}
+
+	if clean == "" {
+		return ""
+	}
+
+	return "+" + clean
+}
+
+func isValidPhone(phone string) bool {
+	// Basic validation: must be at least 10 digits
+	if len(phone) < 11 { // + + 10 digits
+		return false
+	}
+
+	// Reject obvious LID/internal IDs (too long or weird)
+	if len(phone) > 16 {
+		return false
+	}
+
+	return true
+}
+
+// extractMessageText pulls plain text out of any common whatsmeow message wrapper.
+// Returns "" for media, stickers, reactions, and other non-text content.
+func extractMessageText(msg *waProto.Message) string {
+	if msg == nil {
+		return ""
+	}
+	// Direct text
+	if msg.Conversation != nil && *msg.Conversation != "" {
+		return *msg.Conversation
+	}
+	// Text with link preview / formatting
+	if msg.ExtendedTextMessage != nil && msg.ExtendedTextMessage.Text != nil {
+		return *msg.ExtendedTextMessage.Text
+	}
+	// Disappearing messages
+	if msg.EphemeralMessage != nil {
+		return extractMessageText(msg.EphemeralMessage.Message)
+	}
+	// View-once messages
+	if msg.ViewOnceMessage != nil {
+		return extractMessageText(msg.ViewOnceMessage.Message)
+	}
+	// Messages sent from another device of the same account (forwarded to us by the server)
+	if msg.DeviceSentMessage != nil {
+		return extractMessageText(msg.DeviceSentMessage.Message)
+	}
+	// Button reply
+	if msg.ButtonsResponseMessage != nil {
+		if t := msg.ButtonsResponseMessage.GetSelectedDisplayText(); t != "" {
+			return t
+		}
+	}
+	// List reply
+	if msg.ListResponseMessage != nil {
+		if t := msg.ListResponseMessage.GetTitle(); t != "" {
+			return t
+		}
+	}
+	return ""
 }
 
 func (s *WhatsAppService) generateQRDataURL(code string) (string, error) {
@@ -435,11 +601,24 @@ func (s *WhatsAppService) Reinitialize() error {
 	return s.Initialize()
 }
 
+// SetBotService injects the bot service so incoming WhatsApp messages can trigger auto-replies.
+func (s *WhatsAppService) SetBotService(bs interface {
+	HandleIncomingMessage(ctx context.Context, userID, senderPhone, messageText string, waReply func(phone, text string) error)
+}) {
+	s.mu.Lock()
+	s.botService = bs
+	s.mu.Unlock()
+}
+
 // HasRestoredSession returns true when the session was loaded from MongoDB on startup.
 func (s *WhatsAppService) HasRestoredSession() bool { return s.hadRestoredSession }
 
-func (s *WhatsAppService) GetQRChannel() <-chan string  { return s.qrChan }
-func (s *WhatsAppService) GetReadyChannel() <-chan bool { return s.readyChan }
+// GetUserID returns the immutable user ID this service belongs to.
+// Used by callers to assert session ownership before sending.
+func (s *WhatsAppService) GetUserID() string { return s.userID }
+
+func (s *WhatsAppService) GetQRChannel() <-chan string         { return s.qrChan }
+func (s *WhatsAppService) GetReadyChannel() <-chan bool        { return s.readyChan }
 func (s *WhatsAppService) GetDisconnectChannel() <-chan string { return s.disconnectChan }
 
 func (s *WhatsAppService) GetStatus() (isConnected, isReady, hasQR bool) {
@@ -725,6 +904,48 @@ func (s *WhatsAppService) SendMessageWithImageURL(phone, message, imageURL strin
 		return fmt.Errorf("failed to flush temp image file: %w", err)
 	}
 	return s.SendMessageWithImage(phone, message, tempFile)
+}
+
+// WAContact represents a contact fetched from the WhatsApp session store.
+type WAContact struct {
+	Phone string `json:"phone"`
+	Name  string `json:"name"`
+}
+
+// GetWhatsAppContacts returns all contacts stored in the active WhatsApp session.
+// Only phone contacts (JID server = s.whatsapp.net) are included.
+func (s *WhatsAppService) GetWhatsAppContacts(ctx context.Context) ([]WAContact, error) {
+	s.mu.RLock()
+	client := s.client
+	s.mu.RUnlock()
+
+	if client == nil || !s.IsReady() {
+		return nil, fmt.Errorf("WhatsApp is not connected")
+	}
+
+	allContacts, err := client.Store.Contacts.GetAllContacts(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch contacts: %w", err)
+	}
+
+	result := make([]WAContact, 0, len(allContacts))
+	for jid, info := range allContacts {
+		if jid.Server != "s.whatsapp.net" {
+			continue // skip groups, broadcast lists, etc.
+		}
+		name := info.FullName
+		if name == "" {
+			name = info.PushName
+		}
+		if name == "" {
+			name = info.FirstName
+		}
+		result = append(result, WAContact{
+			Phone: "+" + jid.User,
+			Name:  name,
+		})
+	}
+	return result, nil
 }
 
 // detectImageMimeType detects the MIME type of image data using magic bytes.
