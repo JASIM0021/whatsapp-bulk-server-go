@@ -370,23 +370,36 @@ func (h *WhatsAppHandler) SendMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate and cleanup uploaded image after sending
-	if req.Message.ImagePath != "" {
-		// Verify the image file exists before attempting to send
-		info, err := os.Stat(req.Message.ImagePath)
+	// Determine effective messages: use Messages array if provided, else wrap single Message
+	messages := req.Messages
+	if len(messages) == 0 {
+		messages = []types.Message{req.Message}
+	}
+
+	// Verify all uploaded image files exist and schedule cleanup
+	var imagePaths []string
+	for _, msg := range messages {
+		if msg.ImagePath == "" {
+			continue
+		}
+		info, err := os.Stat(msg.ImagePath)
 		if err != nil {
-			logger.Error("Image file not found at path '%s': %v", req.Message.ImagePath, err)
+			logger.Error("Image file not found at path '%s': %v", msg.ImagePath, err)
 			data, _ := json.Marshal(types.ProgressUpdate{Type: "error", Data: fmt.Sprintf("Image file not found: %v", err)})
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
 			return
 		}
-		logger.Info("Image file verified: %s (size: %d bytes)", req.Message.ImagePath, info.Size())
-
+		logger.Info("Image file verified: %s (size: %d bytes)", msg.ImagePath, info.Size())
+		imagePaths = append(imagePaths, msg.ImagePath)
+	}
+	if len(imagePaths) > 0 {
 		defer func() {
-			logger.Info("Cleaning up uploaded image: %s", req.Message.ImagePath)
-			if err := os.Remove(req.Message.ImagePath); err != nil {
-				logger.Warn("Failed to delete uploaded image: %v", err)
+			for _, p := range imagePaths {
+				logger.Info("Cleaning up uploaded image: %s", p)
+				if err := os.Remove(p); err != nil {
+					logger.Warn("Failed to delete uploaded image: %v", err)
+				}
 			}
 		}()
 	}
@@ -401,38 +414,50 @@ func (h *WhatsAppHandler) SendMessages(w http.ResponseWriter, r *http.Request) {
 	for i, contact := range req.Contacts {
 		progress.Current = &req.Contacts[i]
 
-		logger.Section(fmt.Sprintf("MESSAGE %d/%d", i+1, len(req.Contacts)))
+		logger.Section(fmt.Sprintf("CONTACT %d/%d", i+1, len(req.Contacts)))
 		logger.WhatsAppSending(i+1, len(req.Contacts), contact.Name, contact.Phone)
 
-		// Replace {{name}} placeholder with contact name
-		message := strings.ReplaceAll(req.Message.Text, "{{name}}", contact.Name)
-		if req.Message.Link != "" {
-			message += "\n\n" + req.Message.Link
-		}
-
-		// Random delay between 3-5 seconds (skip first message)
+		// Random delay between 3-5 seconds between contacts (skip first)
 		if i > 0 {
 			delay := time.Duration(3000+rand.Intn(2000)) * time.Millisecond
 			logger.WhatsAppDelay(delay)
 			time.Sleep(delay)
 		}
 
-		var sendErr error
-		if req.Message.ImagePath != "" {
-			sendErr = waService.SendMessageWithImage(contact.Phone, message, req.Message.ImagePath)
-		} else if req.Message.ImageURL != "" {
-			sendErr = waService.SendMessageWithImageURL(contact.Phone, message, req.Message.ImageURL)
-		} else {
-			sendErr = waService.SendMessage(contact.Phone, message)
+		contactFailed := false
+		for j, msg := range messages {
+			// Short delay between multiple messages to the same contact
+			if j > 0 {
+				time.Sleep(1 * time.Second)
+			}
+
+			text := strings.ReplaceAll(msg.Text, "{{name}}", contact.Name)
+			if msg.Link != "" {
+				text += "\n\n" + msg.Link
+			}
+
+			var sendErr error
+			if msg.ImagePath != "" {
+				sendErr = waService.SendMessageWithImage(contact.Phone, text, msg.ImagePath)
+			} else if msg.ImageURL != "" {
+				sendErr = waService.SendMessageWithImageURL(contact.Phone, text, msg.ImageURL)
+			} else {
+				sendErr = waService.SendMessage(contact.Phone, text)
+			}
+
+			if sendErr != nil {
+				contactFailed = true
+				progress.Errors = append(progress.Errors, fmt.Sprintf("%s (%s) msg%d: %v", contact.Name, contact.Phone, j+1, sendErr))
+				logger.WhatsAppFailed(i+1, len(req.Contacts), contact.Name, contact.Phone, sendErr)
+			} else {
+				logger.WhatsAppSuccess(i+1, len(req.Contacts), contact.Name, contact.Phone, "N/A")
+			}
 		}
 
-		if sendErr != nil {
+		if contactFailed {
 			progress.Failed++
-			progress.Errors = append(progress.Errors, fmt.Sprintf("%s (%s): %v", contact.Name, contact.Phone, sendErr))
-			logger.WhatsAppFailed(i+1, len(req.Contacts), contact.Name, contact.Phone, sendErr)
 		} else {
 			progress.Sent++
-			logger.WhatsAppSuccess(i+1, len(req.Contacts), contact.Name, contact.Phone, "N/A")
 			// Increment message count for free-plan users
 			if h.subService != nil {
 				h.subService.IncrementMessageCount(r.Context(), userID, 1)

@@ -17,7 +17,8 @@ type Message struct {
 // SendRequest represents the request body for sending messages
 type SendRequest struct {
 	Contacts []Contact `json:"contacts"`
-	Message  Message   `json:"message"`
+	Message  Message   `json:"message"`            // single message (backward compat)
+	Messages []Message `json:"messages,omitempty"` // multiple messages per contact
 }
 
 // UploadResponse represents the response for file upload
