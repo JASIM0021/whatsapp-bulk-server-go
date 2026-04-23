@@ -57,8 +57,15 @@ func (h *SubscriptionHandler) InitiatePayment(w http.ResponseWriter, r *http.Req
 		respondError(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
-	if req.Plan != types.PlanMonthly && req.Plan != types.PlanYearly {
-		respondError(w, "Plan must be 'monthly' or 'yearly'", http.StatusBadRequest)
+	validPlans := map[string]bool{
+		types.PlanMonthly: true, types.PlanYearly: true,
+		types.PlanStarter: true, types.PlanStarterYearly: true,
+		types.PlanGrowth: true, types.PlanGrowthYearly: true,
+		types.PlanBusiness: true, types.PlanBusinessYearly: true,
+		types.PlanAddonMessages: true,
+	}
+	if !validPlans[req.Plan] {
+		respondError(w, "Invalid plan", http.StatusBadRequest)
 		return
 	}
 

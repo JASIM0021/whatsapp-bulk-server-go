@@ -21,19 +21,45 @@ import (
 
 // Plan pricing in INR
 var planPricing = map[string]float64{
-	"monthly": 500,
-	"yearly":  5000,
+	"monthly":          500,
+	"yearly":           5000,
+	"starter":          599,
+	"starter_yearly":   5990,
+	"growth":           1299,
+	"growth_yearly":    12990,
+	"business":         1999,
+	"business_yearly":  19990,
+	"addon_messages":   199,
 }
 
 // Plan durations
 var planDuration = map[string]time.Duration{
-	"free":    7 * 24 * time.Hour,
-	"monthly": 30 * 24 * time.Hour,
-	"yearly":  365 * 24 * time.Hour,
+	"free":             7 * 24 * time.Hour,
+	"monthly":          30 * 24 * time.Hour,
+	"yearly":           365 * 24 * time.Hour,
+	"starter":          30 * 24 * time.Hour,
+	"starter_yearly":   365 * 24 * time.Hour,
+	"growth":           30 * 24 * time.Hour,
+	"growth_yearly":    365 * 24 * time.Hour,
+	"business":         30 * 24 * time.Hour,
+	"business_yearly":  365 * 24 * time.Hour,
+}
+
+// planMessageLimits maps plan IDs to their monthly message quota (0 = unlimited).
+var planMessageLimits = map[string]int{
+	"free":             10,
+	"starter":          1000,
+	"starter_yearly":   1000,
+	"growth":           5000,
+	"growth_yearly":    5000,
+	"business":         15000,
+	"business_yearly":  15000,
+	"monthly":          0, // grandfathered unlimited
+	"yearly":           0, // grandfathered unlimited
 }
 
 // Free trial message limit
-const FreeMessageLimit = 5
+const FreeMessageLimit = 10
 
 type invoiceDoc struct {
 	ID             primitive.ObjectID `bson:"_id,omitempty"`
@@ -305,14 +331,14 @@ func (s *SubscriptionService) IncrementMessageCount(ctx context.Context, userID 
 		return 0, 0, fmt.Errorf("subscription not found")
 	}
 
-	// Only track for free plan
-	if doc.Plan != types.PlanFree {
-		return 0, 0, nil // unlimited for paid plans
+	// Plans with limit 0 (grandfathered legacy plans) are unlimited
+	if planMessageLimits[doc.Plan] == 0 {
+		return 0, 0, nil
 	}
 
 	limit := doc.MessageLimit
 	if limit == 0 {
-		limit = FreeMessageLimit
+		limit = planMessageLimits[doc.Plan]
 	}
 
 	newCount := doc.MessagesUsed + count
@@ -343,13 +369,13 @@ func (s *SubscriptionService) CheckMessageQuota(ctx context.Context, userID stri
 		return 0, fmt.Errorf("subscription not found")
 	}
 
-	if doc.Plan != types.PlanFree {
-		return -1, nil // unlimited
+	if planMessageLimits[doc.Plan] == 0 {
+		return -1, nil // unlimited (grandfathered legacy plans)
 	}
 
 	limit := doc.MessageLimit
 	if limit == 0 {
-		limit = FreeMessageLimit
+		limit = planMessageLimits[doc.Plan]
 	}
 
 	remaining := limit - doc.MessagesUsed
@@ -494,25 +520,40 @@ func (s *SubscriptionService) HandlePaymentSuccess(ctx context.Context, params m
 	}
 
 	now := time.Now()
-	opts := options.Replace().SetUpsert(true)
-	_, err = s.db.Subscriptions().ReplaceOne(ctx,
-		bson.M{"user_id": oid},
-		subscriptionDoc{
-			UserID:     oid,
-			Plan:       plan,
-			Status:     "active",
-			StartDate:  now,
-			ExpiryDate: now.Add(duration),
-			CreatedAt:  now,
-		},
-		opts,
-	)
-	if err != nil {
-		logger.Error("Failed to activate subscription: %v", err)
-		return "", fmt.Errorf("failed to activate subscription: %w", err)
-	}
 
-	logger.Success("Subscription activated: user=%s plan=%s expires=%s", userID, plan, now.Add(duration).Format("2006-01-02"))
+	// addon_messages: increment quota on existing subscription rather than replacing it
+	if plan == types.PlanAddonMessages {
+		_, err = s.db.Subscriptions().UpdateOne(ctx,
+			bson.M{"user_id": oid},
+			bson.M{"$inc": bson.M{"message_limit": 1000}, "$set": bson.M{"status": "active"}},
+		)
+		if err != nil {
+			logger.Error("Failed to add message pack: %v", err)
+			return "", fmt.Errorf("failed to add message pack: %w", err)
+		}
+		logger.Success("Message add-on applied: user=%s +1000 messages", userID)
+	} else {
+		opts := options.Replace().SetUpsert(true)
+		msgLimit := planMessageLimits[plan]
+		_, err = s.db.Subscriptions().ReplaceOne(ctx,
+			bson.M{"user_id": oid},
+			subscriptionDoc{
+				UserID:       oid,
+				Plan:         plan,
+				Status:       "active",
+				StartDate:    now,
+				ExpiryDate:   now.Add(duration),
+				CreatedAt:    now,
+				MessageLimit: msgLimit,
+			},
+			opts,
+		)
+		if err != nil {
+			logger.Error("Failed to activate subscription: %v", err)
+			return "", fmt.Errorf("failed to activate subscription: %w", err)
+		}
+		logger.Success("Subscription activated: user=%s plan=%s expires=%s", userID, plan, now.Add(duration).Format("2006-01-02"))
+	}
 
 	// Create pending invoice record (non-fatal if fails)
 	func() {
@@ -631,22 +672,24 @@ func (s *SubscriptionService) GetPlanConfig(ctx context.Context, plan string) (a
 		return 0, 0, fmt.Errorf("failed to query plan config: %w", fetchErr)
 	}
 	// Fall back to hardcoded defaults
-	switch plan {
-	case "monthly":
-		return planPricing["monthly"], 0, nil
-	case "yearly":
-		return planPricing["yearly"], 0, nil
-	case "free":
-		return 0, FreeMessageLimit, nil
-	default:
+	price, ok := planPricing[plan]
+	if !ok {
 		return 0, 0, fmt.Errorf("invalid plan: %s", plan)
 	}
+	limit := planMessageLimits[plan]
+	return price, limit, nil
 }
 
-// GetPublicPlanPricing returns pricing info for all plans.
+// GetPublicPlanPricing returns pricing info for all active (non-legacy) plans.
 func (s *SubscriptionService) GetPublicPlanPricing(ctx context.Context) map[string]interface{} {
 	result := make(map[string]interface{})
-	for _, plan := range []string{"free", "monthly", "yearly"} {
+	for _, plan := range []string{
+		"free",
+		"starter", "starter_yearly",
+		"growth", "growth_yearly",
+		"business", "business_yearly",
+		"addon_messages",
+	} {
 		amount, messageLimit, _ := s.GetPlanConfig(ctx, plan)
 		result[plan] = map[string]interface{}{
 			"amount":       amount,

@@ -130,9 +130,16 @@ type UpdateTemplateRequest struct {
 
 // Subscription plan constants
 const (
-	PlanFree    = "free"
-	PlanMonthly = "monthly"
-	PlanYearly  = "yearly"
+	PlanFree           = "free"
+	PlanMonthly        = "monthly"        // grandfathered legacy plan
+	PlanYearly         = "yearly"         // grandfathered legacy plan
+	PlanStarter        = "starter"
+	PlanStarterYearly  = "starter_yearly"
+	PlanGrowth         = "growth"
+	PlanGrowthYearly   = "growth_yearly"
+	PlanBusiness       = "business"
+	PlanBusinessYearly = "business_yearly"
+	PlanAddonMessages  = "addon_messages"
 )
 
 // Subscription represents a user's current subscription state

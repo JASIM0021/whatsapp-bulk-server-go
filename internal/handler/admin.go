@@ -804,8 +804,15 @@ func (h *AdminHandler) UpdatePlanConfig(w http.ResponseWriter, r *http.Request) 
 		respondError(w, "Plan name is required", http.StatusBadRequest)
 		return
 	}
-	if planName != "monthly" && planName != "yearly" && planName != "free" {
-		respondError(w, "Plan must be 'monthly', 'yearly', or 'free'", http.StatusBadRequest)
+	validPlans := map[string]bool{
+		"free": true, "monthly": true, "yearly": true,
+		"starter": true, "starter_yearly": true,
+		"growth": true, "growth_yearly": true,
+		"business": true, "business_yearly": true,
+		"addon_messages": true,
+	}
+	if !validPlans[planName] {
+		respondError(w, "Invalid plan name", http.StatusBadRequest)
 		return
 	}
 
