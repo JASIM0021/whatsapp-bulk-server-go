@@ -2,11 +2,13 @@
   "permissions": {
     "allow": [
       "Bash(go run:*)",
-      "Bash(go build:*)"
+      "Bash(go build:*)",
+      "Read(//Users/apple/Desktop/Client/bulk-whatspp-msg/frontend/**)",
+      "Bash(npm run:*)"
     ]
   },
+  "enableAllProjectMcpServers": true,
   "enabledMcpjsonServers": [
     "shadcn"
-  ],
-  "enableAllProjectMcpServers": true
+  ]
 }

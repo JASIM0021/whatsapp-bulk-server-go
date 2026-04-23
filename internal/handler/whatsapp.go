@@ -578,6 +578,22 @@ func (h *WhatsAppHandler) GetContacts(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// DisconnectUser disconnects the WhatsApp session for a specific user and removes
+// it from the in-memory map. Used by the auto-logout idle checker.
+func (h *WhatsAppHandler) DisconnectUser(userID string) {
+	h.mu.RLock()
+	svc, ok := h.services[userID]
+	h.mu.RUnlock()
+	if !ok {
+		return
+	}
+	svc.Disconnect()
+	h.mu.Lock()
+	delete(h.services, userID)
+	h.mu.Unlock()
+	logger.Info("Auto-logout: WhatsApp session disconnected for user %s", userID)
+}
+
 // AutoStartBotSessions queries MongoDB for all users with an enabled bot config
 // and auto-initializes their WhatsApp sessions so the bot starts listening
 // immediately on server start — without requiring the user to open the web panel.

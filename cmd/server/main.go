@@ -112,6 +112,8 @@ func main() {
 	botHandler := handler.NewBotHandler(botService)
 	whatsappHandler.SetBotService(botService)
 	whatsappHandler.SetImageHandler(imageHandler)
+	securityService := service.NewSecurityService(appDB)
+	securityHandler := handler.NewSecurityHandler(securityService)
 
 	// Auth middleware helper
 	authMiddleware := middleware.Auth(authService)
@@ -181,6 +183,10 @@ func main() {
 
 	// Bot config (auth + yearly subscription — plan check is inside the service)
 	mux.Handle("/api/bot", wrap(botHandler.HandleBot))
+
+	// Security settings (auth only)
+	mux.Handle("/api/settings/security", wrap(securityHandler.HandleSettings))
+	mux.Handle("/api/activity/heartbeat", wrap(securityHandler.Heartbeat))
 
 	// API key management (JWT auth — no subscription gate so users can view/revoke after expiry)
 	mux.Handle("/api/apikeys", wrap(func(w http.ResponseWriter, r *http.Request) {
@@ -342,6 +348,27 @@ func main() {
 	// so the bot begins listening immediately on server start without
 	// requiring the user to open the web panel.
 	go whatsappHandler.AutoStartBotSessions(context.Background())
+
+	// Background idle checker: every minute, disconnect WhatsApp sessions
+	// for users who have auto-logout enabled and have been idle for 10+ minutes.
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			ctx := context.Background()
+			idleUsers, err := securityService.FindIdleUsers(ctx, 10*time.Minute)
+			if err != nil {
+				logger.Warn("Auto-logout checker: %v", err)
+				continue
+			}
+			for _, userID := range idleUsers {
+				whatsappHandler.DisconnectUser(userID)
+				// Reset the idle timer so we don't fire every minute forever.
+				// Next disconnect will only happen after another 10 min of inactivity.
+				_ = securityService.RecordActivity(ctx, userID)
+			}
+		}
+	}()
 
 	go func() {
 		logger.Section("SERVER STARTED")
