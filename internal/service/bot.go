@@ -175,7 +175,7 @@ func (s *BotService) HandleIncomingMessage(
 		return
 	}
 
-	// Check subscription plan (yearly only)
+	// Check subscription — any active plan is allowed (free plan respects message quota)
 	sub, err := s.subService.GetSubscription(ctx, userID)
 	if err != nil {
 		logger.Warn("Bot: failed to get subscription for user %s: %v", userID, err)
@@ -185,9 +185,18 @@ func (s *BotService) HandleIncomingMessage(
 		logger.Warn("Bot: user %s has no active subscription", userID)
 		return
 	}
-	if sub.Plan != types.PlanYearly {
-		logger.Info("Bot: user %s is on plan=%s — bot requires yearly plan", userID, sub.Plan)
-		return
+
+	// For free-plan users, enforce the message quota before generating a reply
+	if sub.Plan == types.PlanFree {
+		remaining, err := s.subService.CheckMessageQuota(ctx, userID)
+		if err != nil {
+			logger.Warn("Bot: failed to check quota for user %s: %v", userID, err)
+			return
+		}
+		if remaining == 0 {
+			logger.Info("Bot: free-plan quota exhausted for user %s — skipping reply", userID)
+			return
+		}
 	}
 
 	logger.Info("Bot: generating reply for user=%s from=%s via %s", userID, senderPhone, s.provider)
@@ -200,6 +209,14 @@ func (s *BotService) HandleIncomingMessage(
 	logger.Info("Bot: sending reply to %s: %q", senderPhone, reply)
 	if err := waReply(senderPhone, reply); err != nil {
 		logger.Warn("Bot: failed to send bot reply to %s: %v", senderPhone, err)
+		return
+	}
+
+	// Count bot replies against the free-plan quota (paid plans return early inside IncrementMessageCount)
+	if sub.Plan == types.PlanFree {
+		if _, _, err := s.subService.IncrementMessageCount(ctx, userID, 1); err != nil {
+			logger.Warn("Bot: failed to increment message count for user %s: %v", userID, err)
+		}
 	}
 }
 
