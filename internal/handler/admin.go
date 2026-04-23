@@ -774,7 +774,13 @@ func (h *AdminHandler) GetPlanConfigs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	planNames := []string{"free", "monthly", "yearly"}
+	planNames := []string{
+		"starter", "starter_yearly",
+		"growth", "growth_yearly",
+		"business", "business_yearly",
+		"addon_messages",
+		"free", "monthly", "yearly",
+	}
 	result := make([]types.PlanConfig, 0, len(planNames))
 	for _, plan := range planNames {
 		amount, messageLimit, err := h.subscriptionService.GetPlanConfig(ctx, plan)
