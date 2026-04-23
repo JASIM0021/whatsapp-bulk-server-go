@@ -358,6 +358,108 @@ func (s *EmailService) SendBulkPromotionalEmail(recipients []EmailRecipient, sub
 	return errs
 }
 
+// SendContactQueryAdminNotification sends a new-query alert to an admin.
+func (s *EmailService) SendContactQueryAdminNotification(adminEmail, fromEmail, phone, query string) error {
+	subject := "New Contact Query from " + fromEmail
+
+	phoneRow := ""
+	if phone != "" {
+		phoneRow = fmt.Sprintf(`<tr>
+          <td style="padding:10px 16px;color:#71717a;font-size:13px;border-bottom:1px solid #e4e4e7;">Phone</td>
+          <td style="padding:10px 16px;color:#18181b;font-size:13px;border-bottom:1px solid #e4e4e7;">%s</td>
+        </tr>`, phone)
+	}
+
+	htmlBody := fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background-color:#f4f4f5;font-family:'Segoe UI',Arial,sans-serif;">
+  <table width="100%%" cellpadding="0" cellspacing="0" style="background-color:#f4f4f5;padding:40px 0;">
+    <tr><td align="center">
+      <table width="560" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+        <tr>
+          <td style="background-color:#16a34a;padding:28px 40px;text-align:center;">
+            <h1 style="margin:0;color:#ffffff;font-size:22px;font-weight:700;">BulkSend — New Contact Query</h1>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:32px 40px;">
+            <p style="margin:0 0 20px;color:#3f3f46;font-size:15px;">A visitor has submitted a query via the Contact Us form.</p>
+            <table width="100%%" cellpadding="0" cellspacing="0" style="border:1px solid #e4e4e7;border-radius:8px;overflow:hidden;">
+              <tr style="background-color:#f4f4f5;">
+                <td colspan="2" style="padding:10px 16px;color:#71717a;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;border-bottom:1px solid #e4e4e7;">Query Details</td>
+              </tr>
+              <tr>
+                <td style="padding:10px 16px;color:#71717a;font-size:13px;border-bottom:1px solid #e4e4e7;">From</td>
+                <td style="padding:10px 16px;color:#18181b;font-size:13px;border-bottom:1px solid #e4e4e7;">%s</td>
+              </tr>
+              %s
+              <tr>
+                <td style="padding:10px 16px;color:#71717a;font-size:13px;vertical-align:top;">Message</td>
+                <td style="padding:10px 16px;color:#18181b;font-size:13px;line-height:1.6;">%s</td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+        <tr>
+          <td style="background-color:#fafafa;padding:20px 40px;border-top:1px solid #e4e4e7;text-align:center;">
+            <p style="margin:0;color:#a1a1aa;font-size:12px;">Reply to this email or log into the admin panel to respond.</p>
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`, fromEmail, phoneRow, query)
+
+	return s.sendMail(adminEmail, subject, htmlBody)
+}
+
+// SendContactQueryConfirmation sends an acknowledgement email to the person who submitted the query.
+func (s *EmailService) SendContactQueryConfirmation(toEmail, query string) error {
+	subject := "We received your message — BulkSend Support"
+
+	htmlBody := fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background-color:#f4f4f5;font-family:'Segoe UI',Arial,sans-serif;">
+  <table width="100%%" cellpadding="0" cellspacing="0" style="background-color:#f4f4f5;padding:40px 0;">
+    <tr><td align="center">
+      <table width="560" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+        <tr>
+          <td style="background-color:#16a34a;padding:28px 40px;text-align:center;">
+            <h1 style="margin:0;color:#ffffff;font-size:22px;font-weight:700;">BulkSend Support</h1>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:40px;">
+            <h2 style="margin:0 0 12px;color:#18181b;font-size:20px;">Thanks for reaching out!</h2>
+            <p style="margin:0 0 20px;color:#3f3f46;font-size:15px;line-height:1.6;">
+              We've received your message and our team will get back to you within <strong>24 hours</strong>.
+            </p>
+            <div style="background-color:#f4f4f5;border-left:4px solid #16a34a;border-radius:4px;padding:16px 20px;margin-bottom:24px;">
+              <p style="margin:0 0 6px;color:#71717a;font-size:12px;text-transform:uppercase;letter-spacing:0.5px;">Your message</p>
+              <p style="margin:0;color:#3f3f46;font-size:14px;line-height:1.6;">%s</p>
+            </div>
+            <p style="margin:0;color:#71717a;font-size:14px;line-height:1.5;">
+              In the meantime, feel free to explore our <a href="https://bulksender.todayintech.in/docs" style="color:#16a34a;">documentation</a> or try the <a href="https://wa.me/917679349780?text=Hi" style="color:#16a34a;">live WhatsApp bot</a>.
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <td style="background-color:#fafafa;padding:20px 40px;border-top:1px solid #e4e4e7;text-align:center;">
+            <p style="margin:0;color:#a1a1aa;font-size:12px;">BulkSend &mdash; WhatsApp Bulk Messaging Platform</p>
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`, query)
+
+	return s.sendMail(toEmail, subject, htmlBody)
+}
+
 // sendMail delivers an HTML email via Gmail SMTP with STARTTLS.
 func (s *EmailService) sendMail(to, subject, htmlBody string) error {
 	if s.from == "" || s.password == "" {

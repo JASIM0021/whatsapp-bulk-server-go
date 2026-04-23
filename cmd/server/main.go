@@ -114,6 +114,7 @@ func main() {
 	whatsappHandler.SetImageHandler(imageHandler)
 	securityService := service.NewSecurityService(appDB)
 	securityHandler := handler.NewSecurityHandler(securityService)
+	contactQueryHandler := handler.NewContactQueryHandler(appDB.MongoDB(), emailService)
 
 	// Auth middleware helper
 	authMiddleware := middleware.Auth(authService)
@@ -153,6 +154,9 @@ func main() {
 	// PayU callback routes (PUBLIC — no JWT, security via hash verification)
 	mux.HandleFunc("/api/payment/success", subscriptionHandler.PaymentSuccess)
 	mux.HandleFunc("/api/payment/failure", subscriptionHandler.PaymentFailure)
+
+	// Public contact-us form
+	mux.HandleFunc("/api/contact", contactQueryHandler.Submit)
 
 	// Protected routes (auth only)
 	mux.Handle("/api/auth/me", wrap(authHandler.Me))
