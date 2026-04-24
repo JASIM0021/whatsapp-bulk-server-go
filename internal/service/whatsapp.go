@@ -409,29 +409,36 @@ func (s *WhatsAppService) handleEvents(evt interface{}) {
 		logger.Warn("WhatsApp temporary ban (code: %v)", v.Code)
 
 	case *events.Message:
-		// Detect self-messages (user sent to their own number) and process bot commands.
-		if v.Info.IsFromMe && !v.Info.IsGroup && v.Info.Chat.Server != "broadcast" {
-			s.mu.RLock()
-			botSvc := s.botService
-			userID := s.userID
-			s.mu.RUnlock()
-			if botSvc != nil && userID != "" && s.client != nil && s.client.Store.ID != nil {
-				if v.Info.Chat.User == s.client.Store.ID.User {
-					text := strings.TrimSpace(extractMessageText(v.Message))
-					ownPhone := s.client.Store.ID.User
-					if text != "" {
-						go botSvc.HandleSelfCommand(context.Background(), userID, text,
-							func(_, reply string) error {
-								return s.SendMessage(ownPhone, reply)
-							},
-						)
-					}
-				}
+		// Drop groups and broadcasts immediately.
+		if v.Info.IsGroup || v.Info.Chat.Server == "broadcast" {
+			return
+		}
+
+		s.mu.RLock()
+		botSvc := s.botService
+		userID := s.userID
+		s.mu.RUnlock()
+
+		// Detect self-chat: Chat.User matches the device's own phone number.
+		// This works whether WhatsApp delivers the echo as IsFromMe=true or false.
+		ownPhone := ""
+		if s.client != nil && s.client.Store.ID != nil {
+			ownPhone = s.client.Store.ID.User
+		}
+		if ownPhone != "" && v.Info.Chat.User == ownPhone {
+			text := strings.TrimSpace(extractMessageText(v.Message))
+			if text != "" && botSvc != nil && userID != "" {
+				go botSvc.HandleSelfCommand(context.Background(), userID, text,
+					func(_, reply string) error {
+						return s.SendMessage(ownPhone, reply)
+					},
+				)
 			}
 			return
 		}
-		// Skip other outgoing messages, group chats, and broadcast/status updates
-		if v.Info.IsGroup || v.Info.Chat.Server == "broadcast" {
+
+		// Skip all other outgoing messages (sent to someone else).
+		if v.Info.IsFromMe {
 			return
 		}
 		text := strings.TrimSpace(extractMessageText(v.Message))
@@ -459,11 +466,6 @@ func (s *WhatsAppService) handleEvents(evt interface{}) {
 			return
 		}
 		logger.Info("Bot: incoming message from %s → %q", senderPhone, text)
-
-		s.mu.RLock()
-		botSvc := s.botService
-		userID := s.userID
-		s.mu.RUnlock()
 
 		if botSvc == nil {
 			logger.Info("Bot: no bot service injected for user %s — skipping", userID)
