@@ -452,6 +452,131 @@ func (s *BotService) saveChatHistory(ctx context.Context, userID, contactPhone s
 	return err
 }
 
+// AddExcludedNumber adds a phone number to the user's bot exclusion list (idempotent via $addToSet).
+func (s *BotService) AddExcludedNumber(ctx context.Context, userID, phone string) error {
+	oid, err := primitive.ObjectIDFromHex(userID)
+	if err != nil {
+		return fmt.Errorf("invalid user ID")
+	}
+	phone = strings.TrimPrefix(strings.TrimSpace(phone), "+")
+	if phone == "" {
+		return fmt.Errorf("empty phone number")
+	}
+	_, err = s.db.BotConfigs().UpdateOne(ctx,
+		bson.M{"user_id": oid},
+		bson.M{"$addToSet": bson.M{"excluded_numbers": phone}},
+	)
+	return err
+}
+
+// RemoveExcludedNumber removes a phone number from the user's bot exclusion list.
+func (s *BotService) RemoveExcludedNumber(ctx context.Context, userID, phone string) error {
+	oid, err := primitive.ObjectIDFromHex(userID)
+	if err != nil {
+		return fmt.Errorf("invalid user ID")
+	}
+	phone = strings.TrimPrefix(strings.TrimSpace(phone), "+")
+	if phone == "" {
+		return fmt.Errorf("empty phone number")
+	}
+	_, err = s.db.BotConfigs().UpdateOne(ctx,
+		bson.M{"user_id": oid},
+		bson.M{"$pull": bson.M{"excluded_numbers": phone}},
+	)
+	return err
+}
+
+// SetBotEnabled enables or disables the bot for a user.
+func (s *BotService) SetBotEnabled(ctx context.Context, userID string, enabled bool) error {
+	oid, err := primitive.ObjectIDFromHex(userID)
+	if err != nil {
+		return fmt.Errorf("invalid user ID")
+	}
+	_, err = s.db.BotConfigs().UpdateOne(ctx,
+		bson.M{"user_id": oid},
+		bson.M{"$set": bson.M{"is_enabled": enabled}},
+	)
+	return err
+}
+
+// HandleSelfCommand parses and executes a bot command sent by the user to their own number.
+// Supported commands (case-insensitive):
+//
+//	STOP_REPLY  <phone>  — mute auto-reply for that number
+//	START_REPLY <phone>  — re-enable auto-reply for that number
+//	STOP_BOT             — disable the bot globally
+//	START_BOT            — enable the bot globally
+//	CHECK_HEALTH         — reply with current bot status
+func (s *BotService) HandleSelfCommand(ctx context.Context, userID, text string, waReply func(phone, reply string) error) {
+	upper := strings.ToUpper(strings.TrimSpace(text))
+	parts := strings.Fields(text)
+
+	switch {
+	case strings.HasPrefix(upper, "STOP_REPLY"):
+		if len(parts) < 2 {
+			_ = waReply("", "Usage: STOP_REPLY <phone>  e.g. STOP_REPLY 919876543210")
+			return
+		}
+		phone := strings.TrimSpace(parts[1])
+		if err := s.AddExcludedNumber(ctx, userID, phone); err != nil {
+			logger.Error("Bot: STOP_REPLY failed for %s: %v", phone, err)
+			_ = waReply("", "❌ Failed to exclude "+phone+". Check the number and try again.")
+			return
+		}
+		logger.Success("Bot: excluded %s via STOP_REPLY (user %s)", phone, userID)
+		_ = waReply("", "✅ Auto-reply disabled for "+phone)
+
+	case strings.HasPrefix(upper, "START_REPLY"):
+		if len(parts) < 2 {
+			_ = waReply("", "Usage: START_REPLY <phone>  e.g. START_REPLY 919876543210")
+			return
+		}
+		phone := strings.TrimSpace(parts[1])
+		if err := s.RemoveExcludedNumber(ctx, userID, phone); err != nil {
+			logger.Error("Bot: START_REPLY failed for %s: %v", phone, err)
+			_ = waReply("", "❌ Failed to re-enable "+phone+". Check the number and try again.")
+			return
+		}
+		logger.Success("Bot: removed %s from exclusions via START_REPLY (user %s)", phone, userID)
+		_ = waReply("", "✅ Auto-reply re-enabled for "+phone)
+
+	case upper == "STOP_BOT":
+		if err := s.SetBotEnabled(ctx, userID, false); err != nil {
+			logger.Error("Bot: STOP_BOT failed for user %s: %v", userID, err)
+			_ = waReply("", "❌ Failed to stop bot.")
+			return
+		}
+		logger.Success("Bot: disabled via STOP_BOT command (user %s)", userID)
+		_ = waReply("", "🤖 Bot stopped. Send START_BOT to re-enable.")
+
+	case upper == "START_BOT":
+		if err := s.SetBotEnabled(ctx, userID, true); err != nil {
+			logger.Error("Bot: START_BOT failed for user %s: %v", userID, err)
+			_ = waReply("", "❌ Failed to start bot.")
+			return
+		}
+		logger.Success("Bot: enabled via START_BOT command (user %s)", userID)
+		_ = waReply("", "🤖 Bot is now active and will reply to incoming messages.")
+
+	case upper == "CHECK_HEALTH":
+		cfg, err := s.GetBotConfig(ctx, userID)
+		if err != nil || cfg == nil {
+			_ = waReply("", "⚠️ Bot not configured yet. Visit the dashboard to set it up.")
+			return
+		}
+		status := "🟢 Running"
+		if !cfg.IsEnabled {
+			status = "🔴 Stopped"
+		}
+		excludedCount := len(cfg.ExcludedNumbers)
+		msg := fmt.Sprintf(
+			"*Bot Health*\nStatus: %s\nBusiness: %s\nExcluded numbers: %d\n\nCommands: STOP_BOT · START_BOT · STOP_REPLY <no.> · START_REPLY <no.> · CHECK_HEALTH",
+			status, cfg.BusinessName, excludedCount,
+		)
+		_ = waReply("", msg)
+	}
+}
+
 // ── Helper ────────────────────────────────────────────────────────────────────
 
 func toBotConfigType(doc *botConfigDoc) *types.BotConfig {

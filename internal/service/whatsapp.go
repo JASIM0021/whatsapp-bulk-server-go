@@ -59,6 +59,7 @@ type WhatsAppService struct {
 	// bot support
 	botService interface {
 		HandleIncomingMessage(ctx context.Context, userID, senderPhone, messageText string, waReply func(phone, text string) error)
+		HandleSelfCommand(ctx context.Context, userID, text string, waReply func(phone, text string) error)
 	}
 }
 
@@ -408,8 +409,29 @@ func (s *WhatsAppService) handleEvents(evt interface{}) {
 		logger.Warn("WhatsApp temporary ban (code: %v)", v.Code)
 
 	case *events.Message:
-		// Skip our own outgoing messages, group chats, and broadcast/status updates
-		if v.Info.IsFromMe || v.Info.IsGroup || v.Info.Chat.Server == "broadcast" {
+		// Detect self-messages (user sent to their own number) and process bot commands.
+		if v.Info.IsFromMe && !v.Info.IsGroup && v.Info.Chat.Server != "broadcast" {
+			s.mu.RLock()
+			botSvc := s.botService
+			userID := s.userID
+			s.mu.RUnlock()
+			if botSvc != nil && userID != "" && s.client != nil && s.client.Store.ID != nil {
+				if v.Info.Chat.User == s.client.Store.ID.User {
+					text := strings.TrimSpace(extractMessageText(v.Message))
+					ownPhone := s.client.Store.ID.User
+					if text != "" {
+						go botSvc.HandleSelfCommand(context.Background(), userID, text,
+							func(_, reply string) error {
+								return s.SendMessage(ownPhone, reply)
+							},
+						)
+					}
+				}
+			}
+			return
+		}
+		// Skip other outgoing messages, group chats, and broadcast/status updates
+		if v.Info.IsGroup || v.Info.Chat.Server == "broadcast" {
 			return
 		}
 		text := strings.TrimSpace(extractMessageText(v.Message))
@@ -604,6 +626,7 @@ func (s *WhatsAppService) Reinitialize() error {
 // SetBotService injects the bot service so incoming WhatsApp messages can trigger auto-replies.
 func (s *WhatsAppService) SetBotService(bs interface {
 	HandleIncomingMessage(ctx context.Context, userID, senderPhone, messageText string, waReply func(phone, text string) error)
+	HandleSelfCommand(ctx context.Context, userID, text string, waReply func(phone, text string) error)
 }) {
 	s.mu.Lock()
 	s.botService = bs
