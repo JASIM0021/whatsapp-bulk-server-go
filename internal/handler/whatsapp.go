@@ -340,17 +340,21 @@ func (h *WhatsAppHandler) Disconnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Disconnect and evict from in-memory map if the service is loaded.
 	h.mu.RLock()
 	waService, exists := h.services[userID]
 	h.mu.RUnlock()
-
 	if exists {
-		waService.Disconnect()
+		waService.Disconnect() // also deletes SQLite + MongoDB session internally
 		h.mu.Lock()
 		delete(h.services, userID)
 		h.mu.Unlock()
 		logger.Success("WhatsApp disconnected for user %s", userID)
 	}
+
+	// Always purge the MongoDB session so the user cannot be auto-reconnected,
+	// even when the service was not loaded in memory (e.g. after a server restart).
+	h.purgeSession(userID)
 
 	respondJSON(w, types.APIResponse{
 		Success: true,
@@ -584,14 +588,30 @@ func (h *WhatsAppHandler) DisconnectUser(userID string) {
 	h.mu.RLock()
 	svc, ok := h.services[userID]
 	h.mu.RUnlock()
-	if !ok {
+	if ok {
+		svc.Disconnect() // also deletes SQLite + MongoDB session internally
+		h.mu.Lock()
+		delete(h.services, userID)
+		h.mu.Unlock()
+	}
+	// Always purge MongoDB session so reconnection requires a fresh QR scan.
+	h.purgeSession(userID)
+	logger.Info("Auto-logout: WhatsApp session deleted for user %s", userID)
+}
+
+// purgeSession deletes the WhatsApp session document from MongoDB for a user.
+// Called as a safety net after Disconnect / DisconnectUser to ensure the session
+// cannot be restored by getOrCreateService even if the in-memory service was absent.
+func (h *WhatsAppHandler) purgeSession(userID string) {
+	if h.db == nil || userID == "" {
 		return
 	}
-	svc.Disconnect()
-	h.mu.Lock()
-	delete(h.services, userID)
-	h.mu.Unlock()
-	logger.Info("Auto-logout: WhatsApp session disconnected for user %s", userID)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := h.db.WASessions().DeleteOne(ctx, bson.M{"user_id": userID})
+	if err != nil {
+		logger.Warn("purgeSession: failed to delete MongoDB session for user %s: %v", userID, err)
+	}
 }
 
 // AutoStartBotSessions queries MongoDB for all users with an enabled bot config

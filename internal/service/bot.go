@@ -70,10 +70,11 @@ type botConfigDoc struct {
 	Services        []string           `bson:"services"`
 	BookingLink     string             `bson:"booking_link,omitempty"`
 	ProductLink     string             `bson:"product_link,omitempty"`
-	IsEnabled       bool               `bson:"is_enabled"`
-	ExcludedNumbers []string           `bson:"excluded_numbers"`
-	CreatedAt       time.Time          `bson:"created_at"`
-	UpdatedAt       time.Time          `bson:"updated_at"`
+	IsEnabled          bool               `bson:"is_enabled"`
+	ExcludedNumbers    []string           `bson:"excluded_numbers"`
+	CustomSystemPrompt string             `bson:"custom_system_prompt,omitempty"`
+	CreatedAt          time.Time          `bson:"created_at"`
+	UpdatedAt          time.Time          `bson:"updated_at"`
 }
 
 type chatHistoryDoc struct {
@@ -118,15 +119,16 @@ func (s *BotService) UpsertBotConfig(ctx context.Context, userID string, req typ
 	filter := bson.M{"user_id": oid}
 	update := bson.M{
 		"$set": bson.M{
-			"business_name":    req.BusinessName,
-			"description":      req.Description,
-			"website":          req.Website,
-			"services":         req.Services,
-			"booking_link":     req.BookingLink,
-			"product_link":     req.ProductLink,
-			"is_enabled":       req.IsEnabled,
-			"excluded_numbers": req.ExcludedNumbers,
-			"updated_at":       now,
+			"business_name":        req.BusinessName,
+			"description":          req.Description,
+			"website":              req.Website,
+			"services":             req.Services,
+			"booking_link":         req.BookingLink,
+			"product_link":         req.ProductLink,
+			"is_enabled":           req.IsEnabled,
+			"excluded_numbers":     req.ExcludedNumbers,
+			"custom_system_prompt": req.CustomSystemPrompt,
+			"updated_at":           now,
 		},
 		"$setOnInsert": bson.M{
 			"user_id":    oid,
@@ -369,6 +371,11 @@ func (s *BotService) generateWithOpenAI(
 // ── System prompt builder ─────────────────────────────────────────────────────
 
 func buildSystemPrompt(cfg *types.BotConfig) string {
+	// Use the user's custom prompt verbatim if provided.
+	if strings.TrimSpace(cfg.CustomSystemPrompt) != "" {
+		return strings.TrimSpace(cfg.CustomSystemPrompt)
+	}
+
 	var sb strings.Builder
 	sb.WriteString("You are a helpful WhatsApp customer support assistant for ")
 	sb.WriteString(cfg.BusinessName)
@@ -585,17 +592,18 @@ func toBotConfigType(doc *botConfigDoc) *types.BotConfig {
 		excluded = []string{}
 	}
 	return &types.BotConfig{
-		ID:              doc.ID.Hex(),
-		UserID:          doc.UserID.Hex(),
-		BusinessName:    doc.BusinessName,
-		Description:     doc.Description,
-		Website:         doc.Website,
-		Services:        doc.Services,
-		BookingLink:     doc.BookingLink,
-		ProductLink:     doc.ProductLink,
-		IsEnabled:       doc.IsEnabled,
-		ExcludedNumbers: excluded,
-		CreatedAt:       doc.CreatedAt.Format(time.RFC3339),
-		UpdatedAt:       doc.UpdatedAt.Format(time.RFC3339),
+		ID:                 doc.ID.Hex(),
+		UserID:             doc.UserID.Hex(),
+		BusinessName:       doc.BusinessName,
+		Description:        doc.Description,
+		Website:            doc.Website,
+		Services:           doc.Services,
+		BookingLink:        doc.BookingLink,
+		ProductLink:        doc.ProductLink,
+		IsEnabled:          doc.IsEnabled,
+		ExcludedNumbers:    excluded,
+		CustomSystemPrompt: doc.CustomSystemPrompt,
+		CreatedAt:          doc.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:          doc.UpdatedAt.Format(time.RFC3339),
 	}
 }

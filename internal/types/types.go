@@ -425,22 +425,24 @@ type BotConfig struct {
 	Services        []string `bson:"services"                json:"services"`
 	BookingLink     string   `bson:"booking_link,omitempty"  json:"bookingLink,omitempty"`
 	ProductLink     string   `bson:"product_link,omitempty"  json:"productLink,omitempty"`
-	IsEnabled       bool     `bson:"is_enabled"              json:"isEnabled"`
-	ExcludedNumbers []string `bson:"excluded_numbers"        json:"excludedNumbers"`
-	CreatedAt       string   `bson:"created_at"              json:"createdAt"`
-	UpdatedAt       string   `bson:"updated_at"              json:"updatedAt"`
+	IsEnabled          bool     `bson:"is_enabled"               json:"isEnabled"`
+	ExcludedNumbers    []string `bson:"excluded_numbers"         json:"excludedNumbers"`
+	CustomSystemPrompt string   `bson:"custom_system_prompt,omitempty" json:"customSystemPrompt,omitempty"`
+	CreatedAt          string   `bson:"created_at"               json:"createdAt"`
+	UpdatedAt          string   `bson:"updated_at"               json:"updatedAt"`
 }
 
 // UpsertBotConfigRequest is the request body for POST/PUT /api/bot
 type UpsertBotConfigRequest struct {
-	BusinessName    string   `json:"businessName"`
-	Description     string   `json:"description"`
-	Website         string   `json:"website,omitempty"`
-	Services        []string `json:"services"`
-	BookingLink     string   `json:"bookingLink,omitempty"`
-	ProductLink     string   `json:"productLink,omitempty"`
-	IsEnabled       bool     `json:"isEnabled"`
-	ExcludedNumbers []string `json:"excludedNumbers"`
+	BusinessName       string   `json:"businessName"`
+	Description        string   `json:"description"`
+	Website            string   `json:"website,omitempty"`
+	Services           []string `json:"services"`
+	BookingLink        string   `json:"bookingLink,omitempty"`
+	ProductLink        string   `json:"productLink,omitempty"`
+	IsEnabled          bool     `json:"isEnabled"`
+	ExcludedNumbers    []string `json:"excludedNumbers"`
+	CustomSystemPrompt string   `json:"customSystemPrompt,omitempty"`
 }
 
 // ChatMessage is a single turn in a bot conversation.
