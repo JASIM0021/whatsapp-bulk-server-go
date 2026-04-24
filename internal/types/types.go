@@ -417,28 +417,30 @@ type ScheduleRequest struct {
 
 // BotConfig stores a user's WhatsApp chatbot configuration.
 type BotConfig struct {
-	ID           string   `bson:"_id,omitempty"        json:"id"`
-	UserID       string   `bson:"user_id"              json:"userId"`
-	BusinessName string   `bson:"business_name"        json:"businessName"`
-	Description  string   `bson:"description"          json:"description"`
-	Website      string   `bson:"website,omitempty"    json:"website,omitempty"`
-	Services     []string `bson:"services"             json:"services"`
-	BookingLink  string   `bson:"booking_link,omitempty" json:"bookingLink,omitempty"`
-	ProductLink  string   `bson:"product_link,omitempty" json:"productLink,omitempty"`
-	IsEnabled    bool     `bson:"is_enabled"           json:"isEnabled"`
-	CreatedAt    string   `bson:"created_at"           json:"createdAt"`
-	UpdatedAt    string   `bson:"updated_at"           json:"updatedAt"`
+	ID              string   `bson:"_id,omitempty"           json:"id"`
+	UserID          string   `bson:"user_id"                 json:"userId"`
+	BusinessName    string   `bson:"business_name"           json:"businessName"`
+	Description     string   `bson:"description"             json:"description"`
+	Website         string   `bson:"website,omitempty"       json:"website,omitempty"`
+	Services        []string `bson:"services"                json:"services"`
+	BookingLink     string   `bson:"booking_link,omitempty"  json:"bookingLink,omitempty"`
+	ProductLink     string   `bson:"product_link,omitempty"  json:"productLink,omitempty"`
+	IsEnabled       bool     `bson:"is_enabled"              json:"isEnabled"`
+	ExcludedNumbers []string `bson:"excluded_numbers"        json:"excludedNumbers"`
+	CreatedAt       string   `bson:"created_at"              json:"createdAt"`
+	UpdatedAt       string   `bson:"updated_at"              json:"updatedAt"`
 }
 
 // UpsertBotConfigRequest is the request body for POST/PUT /api/bot
 type UpsertBotConfigRequest struct {
-	BusinessName string   `json:"businessName"`
-	Description  string   `json:"description"`
-	Website      string   `json:"website,omitempty"`
-	Services     []string `json:"services"`
-	BookingLink  string   `json:"bookingLink,omitempty"`
-	ProductLink  string   `json:"productLink,omitempty"`
-	IsEnabled    bool     `json:"isEnabled"`
+	BusinessName    string   `json:"businessName"`
+	Description     string   `json:"description"`
+	Website         string   `json:"website,omitempty"`
+	Services        []string `json:"services"`
+	BookingLink     string   `json:"bookingLink,omitempty"`
+	ProductLink     string   `json:"productLink,omitempty"`
+	IsEnabled       bool     `json:"isEnabled"`
+	ExcludedNumbers []string `json:"excludedNumbers"`
 }
 
 // ChatMessage is a single turn in a bot conversation.

@@ -62,17 +62,18 @@ func NewBotService(database *db.DB, subService *SubscriptionService) *BotService
 // ── MongoDB document types ────────────────────────────────────────────────────
 
 type botConfigDoc struct {
-	ID           primitive.ObjectID `bson:"_id,omitempty"`
-	UserID       primitive.ObjectID `bson:"user_id"`
-	BusinessName string             `bson:"business_name"`
-	Description  string             `bson:"description"`
-	Website      string             `bson:"website,omitempty"`
-	Services     []string           `bson:"services"`
-	BookingLink  string             `bson:"booking_link,omitempty"`
-	ProductLink  string             `bson:"product_link,omitempty"`
-	IsEnabled    bool               `bson:"is_enabled"`
-	CreatedAt    time.Time          `bson:"created_at"`
-	UpdatedAt    time.Time          `bson:"updated_at"`
+	ID              primitive.ObjectID `bson:"_id,omitempty"`
+	UserID          primitive.ObjectID `bson:"user_id"`
+	BusinessName    string             `bson:"business_name"`
+	Description     string             `bson:"description"`
+	Website         string             `bson:"website,omitempty"`
+	Services        []string           `bson:"services"`
+	BookingLink     string             `bson:"booking_link,omitempty"`
+	ProductLink     string             `bson:"product_link,omitempty"`
+	IsEnabled       bool               `bson:"is_enabled"`
+	ExcludedNumbers []string           `bson:"excluded_numbers"`
+	CreatedAt       time.Time          `bson:"created_at"`
+	UpdatedAt       time.Time          `bson:"updated_at"`
 }
 
 type chatHistoryDoc struct {
@@ -117,14 +118,15 @@ func (s *BotService) UpsertBotConfig(ctx context.Context, userID string, req typ
 	filter := bson.M{"user_id": oid}
 	update := bson.M{
 		"$set": bson.M{
-			"business_name": req.BusinessName,
-			"description":   req.Description,
-			"website":       req.Website,
-			"services":      req.Services,
-			"booking_link":  req.BookingLink,
-			"product_link":  req.ProductLink,
-			"is_enabled":    req.IsEnabled,
-			"updated_at":    now,
+			"business_name":    req.BusinessName,
+			"description":      req.Description,
+			"website":          req.Website,
+			"services":         req.Services,
+			"booking_link":     req.BookingLink,
+			"product_link":     req.ProductLink,
+			"is_enabled":       req.IsEnabled,
+			"excluded_numbers": req.ExcludedNumbers,
+			"updated_at":       now,
 		},
 		"$setOnInsert": bson.M{
 			"user_id":    oid,
@@ -173,6 +175,14 @@ func (s *BotService) HandleIncomingMessage(
 	if !cfg.IsEnabled {
 		logger.Info("Bot: bot is disabled for user %s — enable it at /bot", userID)
 		return
+	}
+
+	// Check if sender is in the exclusion list
+	for _, excluded := range cfg.ExcludedNumbers {
+		if strings.TrimSpace(excluded) == strings.TrimSpace(senderPhone) {
+			logger.Info("Bot: skipping auto-reply for excluded number %s (user %s)", senderPhone, userID)
+			return
+		}
 	}
 
 	// Check subscription — any active plan is allowed (free plan respects message quota)
@@ -445,17 +455,22 @@ func (s *BotService) saveChatHistory(ctx context.Context, userID, contactPhone s
 // ── Helper ────────────────────────────────────────────────────────────────────
 
 func toBotConfigType(doc *botConfigDoc) *types.BotConfig {
+	excluded := doc.ExcludedNumbers
+	if excluded == nil {
+		excluded = []string{}
+	}
 	return &types.BotConfig{
-		ID:           doc.ID.Hex(),
-		UserID:       doc.UserID.Hex(),
-		BusinessName: doc.BusinessName,
-		Description:  doc.Description,
-		Website:      doc.Website,
-		Services:     doc.Services,
-		BookingLink:  doc.BookingLink,
-		ProductLink:  doc.ProductLink,
-		IsEnabled:    doc.IsEnabled,
-		CreatedAt:    doc.CreatedAt.Format(time.RFC3339),
-		UpdatedAt:    doc.UpdatedAt.Format(time.RFC3339),
+		ID:              doc.ID.Hex(),
+		UserID:          doc.UserID.Hex(),
+		BusinessName:    doc.BusinessName,
+		Description:     doc.Description,
+		Website:         doc.Website,
+		Services:        doc.Services,
+		BookingLink:     doc.BookingLink,
+		ProductLink:     doc.ProductLink,
+		IsEnabled:       doc.IsEnabled,
+		ExcludedNumbers: excluded,
+		CreatedAt:       doc.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:       doc.UpdatedAt.Format(time.RFC3339),
 	}
 }
