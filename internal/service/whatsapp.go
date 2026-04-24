@@ -499,19 +499,19 @@ func ExtractSenderPhone(info *types.MessageInfo) (string, bool) {
 
 	var candidates []string
 
-	// 1. Highest priority: SenderAlt (real phone in LID mode)
+	// 1. SenderAlt — explicit real phone provided by WhatsApp for LID-addressed messages
 	if info.SenderAlt.User != "" {
 		candidates = append(candidates, info.SenderAlt.User)
 	}
 
-	// 2. Chat user (VERY important for 1:1 LID messages)
-	if info.Chat.User != "" {
-		candidates = append(candidates, info.Chat.User)
-	}
-
-	// 3. Sender (PN mode OR fallback)
+	// 2. Sender — real phone in PN mode; will be an internal LID in LID mode (fails validation → next candidate tried)
 	if info.Sender.User != "" {
 		candidates = append(candidates, info.Sender.User)
+	}
+
+	// 3. Chat.User — fallback for 1:1 LID chats where Sender is an opaque ID and SenderAlt is absent
+	if info.Chat.User != "" {
+		candidates = append(candidates, info.Chat.User)
 	}
 
 	// Try to extract a valid phone from candidates
@@ -545,13 +545,13 @@ func normalizePhone(user string) string {
 }
 
 func isValidPhone(phone string) bool {
-	// Basic validation: must be at least 10 digits
-	if len(phone) < 11 { // + + 10 digits
+	// E.164: "+" followed by 7–13 digits (WhatsApp never uses 14+ digit numbers)
+	if len(phone) < 8 { // + + 7 digits minimum
 		return false
 	}
 
-	// Reject obvious LID/internal IDs (too long or weird)
-	if len(phone) > 16 {
+	// Reject obvious LID/internal IDs — WhatsApp numbers max out at 13 digits
+	if len(phone) > 14 { // + + 13 digits
 		return false
 	}
 
