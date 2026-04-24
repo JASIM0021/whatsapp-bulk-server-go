@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"github.com/JASIM0021/bulk-whatsapp-send/backend/internal/service"
 	"github.com/JASIM0021/bulk-whatsapp-send/backend/internal/types"
@@ -45,8 +46,10 @@ func (h *BotHandler) HandleBot(w http.ResponseWriter, r *http.Request) {
 			respondError(w, "Invalid request body", http.StatusBadRequest)
 			return
 		}
-		if req.BusinessName == "" || req.Description == "" {
-			respondError(w, "businessName and description are required", http.StatusBadRequest)
+		// When a custom system prompt is provided, business info fields are optional.
+		hasCustomPrompt := strings.TrimSpace(req.CustomSystemPrompt) != ""
+		if !hasCustomPrompt && (strings.TrimSpace(req.BusinessName) == "" || strings.TrimSpace(req.Description) == "") {
+			respondError(w, "businessName and description are required (or provide a custom system prompt)", http.StatusBadRequest)
 			return
 		}
 
