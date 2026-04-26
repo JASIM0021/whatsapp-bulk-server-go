@@ -1044,8 +1044,22 @@ func (h *AdminHandler) UpdateUserPlan(w http.ResponseWriter, r *http.Request) {
 		respondError(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
-	if req.Plan != "free" && req.Plan != "monthly" && req.Plan != "yearly" {
-		respondError(w, "plan must be free, monthly, or yearly", http.StatusBadRequest)
+	validAdminPlans := map[string]int{
+		"free":               7,
+		"starter":            30,
+		"starter_yearly":     365,
+		"growth":             30,
+		"growth_yearly":      365,
+		"business":           30,
+		"business_yearly":    365,
+		"monthly":            30,
+		"yearly":             365,
+		"unlimited_monthly":  36500,
+		"unlimited_yearly":   36500,
+	}
+	defaultDays, ok := validAdminPlans[req.Plan]
+	if !ok {
+		respondError(w, "invalid plan", http.StatusBadRequest)
 		return
 	}
 
@@ -1057,14 +1071,7 @@ func (h *AdminHandler) UpdateUserPlan(w http.ResponseWriter, r *http.Request) {
 
 	daysToAdd := req.DaysToAdd
 	if daysToAdd <= 0 {
-		switch req.Plan {
-		case "free":
-			daysToAdd = 7
-		case "monthly":
-			daysToAdd = 30
-		case "yearly":
-			daysToAdd = 365
-		}
+		daysToAdd = defaultDays
 	}
 
 	now := time.Now()

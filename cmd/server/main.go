@@ -151,6 +151,9 @@ func main() {
 	mux.HandleFunc("/api/auth/reset-password", authHandler.ResetPassword)
 	mux.HandleFunc("/api/auth/login", authHandler.Login)
 
+	// Payment gateway info (PUBLIC)
+	mux.HandleFunc("/api/payment/gateway", subscriptionHandler.GetPaymentGateway)
+
 	// PayU callback routes (PUBLIC — no JWT, security via hash verification)
 	mux.HandleFunc("/api/payment/success", subscriptionHandler.PaymentSuccess)
 	mux.HandleFunc("/api/payment/failure", subscriptionHandler.PaymentFailure)
@@ -162,6 +165,7 @@ func main() {
 	mux.Handle("/api/auth/me", wrap(authHandler.Me))
 	mux.Handle("/api/subscription", wrap(subscriptionHandler.GetSubscription))
 	mux.Handle("/api/payment/initiate", wrap(subscriptionHandler.InitiatePayment))
+	mux.Handle("/api/payment/razorpay/verify", wrap(subscriptionHandler.RazorpayVerify))
 	mux.Handle("/api/payment/history", wrap(subscriptionHandler.GetPaymentHistory))
 	mux.Handle("/api/payment/validate-promo", wrap(subscriptionHandler.ValidatePromoCode))
 

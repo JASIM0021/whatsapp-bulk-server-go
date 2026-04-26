@@ -1,10 +1,16 @@
 package service
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/sha512"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -129,19 +135,25 @@ type promoCodeDoc struct {
 }
 
 type SubscriptionService struct {
-	db          *db.DB
-	emailSvc    *EmailService
-	merchantKey string
-	salt        string
-	baseURL     string
-	backendURL  string
-	frontendURL string
+	db                *db.DB
+	emailSvc          *EmailService
+	// PayU fields
+	merchantKey       string
+	salt              string
+	baseURL           string
+	// Razorpay fields
+	razorpayKeyID     string
+	razorpayKeySecret string
+	// Shared
+	gatewayType       string // "payu" | "razorpay"
+	backendURL        string
+	frontendURL       string
 }
 
 func NewSubscriptionService(database *db.DB) *SubscriptionService {
-	baseURL := os.Getenv("PAYU_BASE_URL")
-	if baseURL == "" {
-		baseURL = "https://secure.payu.in"
+	payuBaseURL := os.Getenv("PAYU_BASE_URL")
+	if payuBaseURL == "" {
+		payuBaseURL = "https://secure.payu.in"
 	}
 	backendURL := os.Getenv("BACKEND_URL")
 	if backendURL == "" {
@@ -151,14 +163,26 @@ func NewSubscriptionService(database *db.DB) *SubscriptionService {
 	if frontendURL == "" {
 		frontendURL = "http://localhost:5174"
 	}
-	return &SubscriptionService{
-		db:          database,
-		merchantKey: os.Getenv("PAYU_MERCHANT_KEY"),
-		salt:        os.Getenv("PAYU_SALT"),
-		baseURL:     baseURL,
-		backendURL:  backendURL,
-		frontendURL: frontendURL,
+	gatewayType := strings.ToLower(strings.TrimSpace(os.Getenv("PAYMENT_GATEWAY")))
+	if gatewayType != "razorpay" {
+		gatewayType = "payu" // default
 	}
+	return &SubscriptionService{
+		db:                database,
+		merchantKey:       os.Getenv("PAYU_MERCHANT_KEY"),
+		salt:              os.Getenv("PAYU_SALT"),
+		baseURL:           payuBaseURL,
+		razorpayKeyID:     os.Getenv("RAZORPAY_KEY_ID"),
+		razorpayKeySecret: os.Getenv("RAZORPAY_KEY_SECRET"),
+		gatewayType:       gatewayType,
+		backendURL:        backendURL,
+		frontendURL:       frontendURL,
+	}
+}
+
+// GetGateway returns the configured payment gateway name.
+func (s *SubscriptionService) GetGateway() string {
+	return s.gatewayType
 }
 
 // SetEmailService sets the email service reference.
@@ -403,11 +427,20 @@ func calculateDiscountedAmount(original float64, discountType string, discountVa
 	return math.Round(discounted*100) / 100
 }
 
-// InitiatePayment creates a payment record and returns PayU form data.
-func (s *SubscriptionService) InitiatePayment(ctx context.Context, userID, plan, email, name, phone, promoCode string) (*types.PayUFormData, error) {
+// InitiatePayment dispatches to the configured payment gateway.
+// Returns *types.PayUFormData (gateway="payu") or *types.RazorpayOrderData (gateway="razorpay").
+func (s *SubscriptionService) InitiatePayment(ctx context.Context, userID, plan, email, name, phone, promoCode string) (interface{}, error) {
+	if s.gatewayType == "razorpay" {
+		return s.initiateRazorpayOrder(ctx, userID, plan, email, name, phone, promoCode)
+	}
+	return s.initiatePayUPayment(ctx, userID, plan, email, name, phone, promoCode)
+}
+
+// initiatePayUPayment creates a payment record and returns PayU form data.
+func (s *SubscriptionService) initiatePayUPayment(ctx context.Context, userID, plan, email, name, phone, promoCode string) (*types.PayUFormData, error) {
 	originalAmount, _, err := s.GetPlanConfig(ctx, plan)
 	if err != nil || originalAmount == 0 {
-		return nil, fmt.Errorf("invalid plan: %s (must be 'monthly' or 'yearly')", plan)
+		return nil, fmt.Errorf("invalid plan: %s", plan)
 	}
 
 	oid, err := primitive.ObjectIDFromHex(userID)
@@ -417,22 +450,18 @@ func (s *SubscriptionService) InitiatePayment(ctx context.Context, userID, plan,
 
 	amount := originalAmount
 	appliedPromo := ""
-
-	// Apply promo code if provided
 	if promoCode != "" {
 		validation, valErr := s.ValidatePromoCode(ctx, promoCode, plan)
 		if valErr == nil && validation.Valid {
 			amount = validation.FinalAmount
 			appliedPromo = validation.Code
 		}
-		// If invalid, silently ignore the promo and charge full price
 	}
 
 	txnID := fmt.Sprintf("TXN_%s_%d", userID[:8], time.Now().UnixNano())
 	amountStr := fmt.Sprintf("%.2f", amount)
 	productInfo := fmt.Sprintf("BulkSend %s Plan", strings.Title(plan))
 
-	// Store pending payment
 	payDoc := paymentDoc{
 		ID:             primitive.NewObjectID(),
 		UserID:         oid,
@@ -447,20 +476,17 @@ func (s *SubscriptionService) InitiatePayment(ctx context.Context, userID, plan,
 	if _, err := s.db.Payments().InsertOne(ctx, payDoc); err != nil {
 		return nil, fmt.Errorf("failed to create payment record: %w", err)
 	}
-
-	// Increment promo usage atomically after payment record is created
 	if appliedPromo != "" {
 		_ = s.incrementPromoUsage(ctx, appliedPromo)
 	}
 
-	// Generate PayU hash
 	udf1 := userID
 	udf2 := plan
 	hash := generatePayUHash(s.merchantKey, txnID, amountStr, productInfo, name, email, udf1, udf2, "", "", "", s.salt)
-
-	logger.Info("Payment initiated: txn=%s user=%s plan=%s amount=%s", txnID, userID, plan, amountStr)
+	logger.Info("PayU payment initiated: txn=%s user=%s plan=%s amount=%s", txnID, userID, plan, amountStr)
 
 	return &types.PayUFormData{
+		Gateway:     "payu",
 		Action:      s.baseURL + "/_payment",
 		Key:         s.merchantKey,
 		TxnID:       txnID,
@@ -480,9 +506,154 @@ func (s *SubscriptionService) InitiatePayment(ctx context.Context, userID, plan,
 	}, nil
 }
 
+// initiateRazorpayOrder creates a Razorpay order and returns checkout data for the frontend.
+func (s *SubscriptionService) initiateRazorpayOrder(ctx context.Context, userID, plan, email, name, phone, promoCode string) (*types.RazorpayOrderData, error) {
+	originalAmount, _, err := s.GetPlanConfig(ctx, plan)
+	if err != nil || originalAmount == 0 {
+		return nil, fmt.Errorf("invalid plan: %s", plan)
+	}
+
+	oid, err := primitive.ObjectIDFromHex(userID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid user ID")
+	}
+
+	amount := originalAmount
+	appliedPromo := ""
+	if promoCode != "" {
+		validation, valErr := s.ValidatePromoCode(ctx, promoCode, plan)
+		if valErr == nil && validation.Valid {
+			amount = validation.FinalAmount
+			appliedPromo = validation.Code
+		}
+	}
+
+	txnID := fmt.Sprintf("TXN_%s_%d", userID[:8], time.Now().UnixNano())
+	amountPaise := int64(math.Round(amount * 100))
+
+	// Create order via Razorpay Orders API
+	razorpayOrderID, err := s.createRazorpayOrder(txnID, amountPaise)
+	if err != nil {
+		return nil, fmt.Errorf("razorpay order creation failed: %w", err)
+	}
+
+	payDoc := paymentDoc{
+		ID:             primitive.NewObjectID(),
+		UserID:         oid,
+		TxnID:          txnID,
+		Amount:         amount,
+		OriginalAmount: originalAmount,
+		Plan:           plan,
+		Status:         "pending",
+		PromoCode:      appliedPromo,
+		MihpayID:       razorpayOrderID, // store razorpay order_id here
+		CreatedAt:      time.Now(),
+	}
+	if _, err := s.db.Payments().InsertOne(ctx, payDoc); err != nil {
+		return nil, fmt.Errorf("failed to create payment record: %w", err)
+	}
+	if appliedPromo != "" {
+		_ = s.incrementPromoUsage(ctx, appliedPromo)
+	}
+
+	logger.Info("Razorpay order created: txn=%s order=%s user=%s plan=%s amount=%.2f", txnID, razorpayOrderID, userID, plan, amount)
+
+	return &types.RazorpayOrderData{
+		Gateway:      "razorpay",
+		OrderID:      razorpayOrderID,
+		Amount:       amountPaise,
+		Currency:     "INR",
+		KeyID:        s.razorpayKeyID,
+		TxnID:        txnID,
+		Description:  fmt.Sprintf("BulkSend %s Plan", strings.Title(plan)),
+		PrefillName:  name,
+		PrefillEmail: email,
+		PrefillPhone: phone,
+	}, nil
+}
+
+// createRazorpayOrder calls Razorpay Orders API and returns the order ID.
+func (s *SubscriptionService) createRazorpayOrder(receipt string, amountPaise int64) (string, error) {
+	payload, _ := json.Marshal(map[string]interface{}{
+		"amount":   amountPaise,
+		"currency": "INR",
+		"receipt":  receipt,
+	})
+
+	req, err := http.NewRequest(http.MethodPost, "https://api.razorpay.com/v1/orders", bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	req.SetBasicAuth(s.razorpayKeyID, s.razorpayKeySecret)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("HTTP request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("failed to decode Razorpay response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		if errObj, ok := result["error"].(map[string]interface{}); ok {
+			return "", fmt.Errorf("razorpay: %v", errObj["description"])
+		}
+		return "", fmt.Errorf("razorpay API returned status %d", resp.StatusCode)
+	}
+
+	orderID, ok := result["id"].(string)
+	if !ok || orderID == "" {
+		return "", fmt.Errorf("invalid order ID in Razorpay response")
+	}
+	return orderID, nil
+}
+
+// VerifyRazorpayPayment verifies signature and activates the subscription.
+func (s *SubscriptionService) VerifyRazorpayPayment(ctx context.Context, req types.RazorpayVerifyRequest) (string, error) {
+	// HMAC-SHA256(orderID|paymentID, key_secret)
+	mac := hmac.New(sha256.New, []byte(s.razorpayKeySecret))
+	mac.Write([]byte(req.RazorpayOrderID + "|" + req.RazorpayPaymentID))
+	expected := hex.EncodeToString(mac.Sum(nil))
+
+	if !strings.EqualFold(expected, req.RazorpaySignature) {
+		logger.Error("Razorpay signature mismatch for txn %s", req.TxnID)
+		return "", fmt.Errorf("signature verification failed")
+	}
+
+	var payDoc paymentDoc
+	if err := s.db.Payments().FindOne(ctx, bson.M{"txn_id": req.TxnID}).Decode(&payDoc); err != nil {
+		return "", fmt.Errorf("payment record not found: %s", req.TxnID)
+	}
+
+	if payDoc.Status == "success" {
+		return req.TxnID, nil // idempotent
+	}
+
+	s.db.Payments().UpdateOne(ctx, //nolint:errcheck
+		bson.M{"txn_id": req.TxnID},
+		bson.M{"$set": bson.M{
+			"status":        "success",
+			"mihpay_id":     req.RazorpayPaymentID,
+			"payu_response": fmt.Sprintf("gateway=razorpay&order_id=%s&payment_id=%s", req.RazorpayOrderID, req.RazorpayPaymentID),
+		}},
+	)
+
+	if err := s.activateSubscription(ctx, payDoc.UserID, payDoc.Plan); err != nil {
+		return "", err
+	}
+	s.createInvoiceRecord(ctx, req.TxnID, req.RazorpayPaymentID, payDoc.Plan, payDoc.UserID)
+
+	logger.Success("Razorpay payment verified: txn=%s user=%s plan=%s", req.TxnID, payDoc.UserID.Hex(), payDoc.Plan)
+	return req.TxnID, nil
+}
+
 // HandlePaymentSuccess processes a successful PayU callback.
 func (s *SubscriptionService) HandlePaymentSuccess(ctx context.Context, params map[string]string) (string, error) {
-	// Verify hash
 	if !s.verifyPayUResponseHash(params) {
 		logger.Error("PayU hash verification failed for txn %s", params["txnid"])
 		return "", fmt.Errorf("hash verification failed")
@@ -493,10 +664,9 @@ func (s *SubscriptionService) HandlePaymentSuccess(ctx context.Context, params m
 	plan := params["udf2"]
 	mihpayID := params["mihpayid"]
 
-	logger.Success("Payment verified: txn=%s user=%s plan=%s mihpayid=%s", txnID, userID, plan, mihpayID)
+	logger.Success("PayU payment verified: txn=%s user=%s plan=%s mihpayid=%s", txnID, userID, plan, mihpayID)
 
-	// Update payment record
-	_, err := s.db.Payments().UpdateOne(ctx,
+	s.db.Payments().UpdateOne(ctx, //nolint:errcheck
 		bson.M{"txn_id": txnID},
 		bson.M{"$set": bson.M{
 			"status":        "success",
@@ -504,99 +674,109 @@ func (s *SubscriptionService) HandlePaymentSuccess(ctx context.Context, params m
 			"payu_response": fmt.Sprintf("status=%s&mihpayid=%s", params["status"], mihpayID),
 		}},
 	)
-	if err != nil {
-		logger.Error("Failed to update payment record: %v", err)
-	}
 
-	// Activate subscription
 	oid, err := primitive.ObjectIDFromHex(userID)
 	if err != nil {
 		return "", fmt.Errorf("invalid user ID in callback")
+	}
+
+	if err := s.activateSubscription(ctx, oid, plan); err != nil {
+		return "", err
+	}
+	s.createInvoiceRecord(ctx, txnID, mihpayID, plan, oid)
+
+	return txnID, nil
+}
+
+// activateSubscription upserts the user's subscription for the given plan.
+func (s *SubscriptionService) activateSubscription(ctx context.Context, userOID primitive.ObjectID, plan string) error {
+	duration, ok := planDuration[plan]
+	if !ok {
+		duration = 30 * 24 * time.Hour
+	}
+	now := time.Now()
+
+	if plan == types.PlanAddonMessages {
+		_, err := s.db.Subscriptions().UpdateOne(ctx,
+			bson.M{"user_id": userOID},
+			bson.M{"$inc": bson.M{"message_limit": 1000}, "$set": bson.M{"status": "active"}},
+		)
+		if err != nil {
+			logger.Error("Failed to add message pack for user %s: %v", userOID.Hex(), err)
+			return fmt.Errorf("failed to add message pack: %w", err)
+		}
+		logger.Success("Message add-on applied: user=%s +1000 messages", userOID.Hex())
+		return nil
+	}
+
+	opts := options.Replace().SetUpsert(true)
+	msgLimit := planMessageLimits[plan]
+	_, err := s.db.Subscriptions().ReplaceOne(ctx,
+		bson.M{"user_id": userOID},
+		subscriptionDoc{
+			UserID:       userOID,
+			Plan:         plan,
+			Status:       "active",
+			StartDate:    now,
+			ExpiryDate:   now.Add(duration),
+			CreatedAt:    now,
+			MessageLimit: msgLimit,
+		},
+		opts,
+	)
+	if err != nil {
+		logger.Error("Failed to activate subscription for user %s: %v", userOID.Hex(), err)
+		return fmt.Errorf("failed to activate subscription: %w", err)
+	}
+	logger.Success("Subscription activated: user=%s plan=%s expires=%s", userOID.Hex(), plan, now.Add(duration).Format("2006-01-02"))
+	return nil
+}
+
+// createInvoiceRecord creates a pending invoice for a completed payment (non-fatal).
+func (s *SubscriptionService) createInvoiceRecord(ctx context.Context, txnID, paymentID, plan string, userOID primitive.ObjectID) {
+	var payDoc paymentDoc
+	if err := s.db.Payments().FindOne(ctx, bson.M{"txn_id": txnID}).Decode(&payDoc); err != nil {
+		logger.Error("Invoice: failed to fetch payment doc: %v", err)
+		return
+	}
+	var userDoc struct {
+		Email string `bson:"email"`
+		Name  string `bson:"name"`
+	}
+	if err := s.db.Users().FindOne(ctx, bson.M{"_id": userOID}).Decode(&userDoc); err != nil {
+		logger.Error("Invoice: failed to fetch user doc: %v", err)
+		return
 	}
 
 	duration, ok := planDuration[plan]
 	if !ok {
 		duration = 30 * 24 * time.Hour
 	}
-
 	now := time.Now()
-
-	// addon_messages: increment quota on existing subscription rather than replacing it
-	if plan == types.PlanAddonMessages {
-		_, err = s.db.Subscriptions().UpdateOne(ctx,
-			bson.M{"user_id": oid},
-			bson.M{"$inc": bson.M{"message_limit": 1000}, "$set": bson.M{"status": "active"}},
-		)
-		if err != nil {
-			logger.Error("Failed to add message pack: %v", err)
-			return "", fmt.Errorf("failed to add message pack: %w", err)
-		}
-		logger.Success("Message add-on applied: user=%s +1000 messages", userID)
-	} else {
-		opts := options.Replace().SetUpsert(true)
-		msgLimit := planMessageLimits[plan]
-		_, err = s.db.Subscriptions().ReplaceOne(ctx,
-			bson.M{"user_id": oid},
-			subscriptionDoc{
-				UserID:       oid,
-				Plan:         plan,
-				Status:       "active",
-				StartDate:    now,
-				ExpiryDate:   now.Add(duration),
-				CreatedAt:    now,
-				MessageLimit: msgLimit,
-			},
-			opts,
-		)
-		if err != nil {
-			logger.Error("Failed to activate subscription: %v", err)
-			return "", fmt.Errorf("failed to activate subscription: %w", err)
-		}
-		logger.Success("Subscription activated: user=%s plan=%s expires=%s", userID, plan, now.Add(duration).Format("2006-01-02"))
+	invID := primitive.NewObjectID()
+	hexStr := invID.Hex()
+	invDoc := invoiceDoc{
+		ID:             invID,
+		InvoiceNumber:  fmt.Sprintf("INV-%s-%s", now.Format("200601"), hexStr[len(hexStr)-6:]),
+		UserID:         userOID,
+		UserName:       userDoc.Name,
+		UserEmail:      userDoc.Email,
+		Plan:           plan,
+		OriginalAmount: payDoc.OriginalAmount,
+		FinalAmount:    payDoc.Amount,
+		PromoCode:      payDoc.PromoCode,
+		TxnID:          txnID,
+		MihpayID:       paymentID,
+		Status:         "pending",
+		PaymentDate:    now,
+		ExpiryDate:     now.Add(duration),
+		CreatedAt:      now,
 	}
-
-	// Create pending invoice record (non-fatal if fails)
-	func() {
-		var payDoc paymentDoc
-		if fetchErr := s.db.Payments().FindOne(ctx, bson.M{"txn_id": txnID}).Decode(&payDoc); fetchErr != nil {
-			logger.Error("Invoice creation: failed to fetch payment doc: %v", fetchErr)
-			return
-		}
-		var userDoc struct {
-			Email string `bson:"email"`
-			Name  string `bson:"name"`
-		}
-		if fetchErr := s.db.Users().FindOne(ctx, bson.M{"_id": oid}).Decode(&userDoc); fetchErr != nil {
-			logger.Error("Invoice creation: failed to fetch user doc: %v", fetchErr)
-			return
-		}
-		invID := primitive.NewObjectID()
-		hexStr := invID.Hex()
-		invDoc := invoiceDoc{
-			ID:             invID,
-			InvoiceNumber:  fmt.Sprintf("INV-%s-%s", now.Format("200601"), hexStr[len(hexStr)-6:]),
-			UserID:         oid,
-			UserName:       userDoc.Name,
-			UserEmail:      userDoc.Email,
-			Plan:           plan,
-			OriginalAmount: payDoc.OriginalAmount,
-			FinalAmount:    payDoc.Amount,
-			PromoCode:      payDoc.PromoCode,
-			TxnID:          txnID,
-			MihpayID:       mihpayID,
-			Status:         "pending",
-			PaymentDate:    now,
-			ExpiryDate:     now.Add(duration),
-			CreatedAt:      now,
-		}
-		if _, insertErr := s.db.Invoices().InsertOne(ctx, invDoc); insertErr != nil {
-			logger.Error("Failed to create invoice: %v", insertErr)
-		} else {
-			logger.Info("Invoice created: %s for user %s", invDoc.InvoiceNumber, oid.Hex())
-		}
-	}()
-
-	return txnID, nil
+	if _, err := s.db.Invoices().InsertOne(ctx, invDoc); err != nil {
+		logger.Error("Failed to create invoice: %v", err)
+	} else {
+		logger.Info("Invoice created: %s for user %s", invDoc.InvoiceNumber, userOID.Hex())
+	}
 }
 
 // HandlePaymentFailure processes a failed PayU callback.
@@ -999,8 +1179,25 @@ func (s *SubscriptionService) UpdatePromoCode(ctx context.Context, id string, re
 	if req.MaxUses != nil {
 		update["max_uses"] = *req.MaxUses
 	}
+	if req.DiscountType != nil {
+		update["discount_type"] = *req.DiscountType
+	}
 	if req.DiscountValue != nil {
 		update["discount_value"] = *req.DiscountValue
+	}
+	if req.ApplicablePlans != nil {
+		update["applicable_plans"] = req.ApplicablePlans
+	}
+	if req.ExpiresAt != nil {
+		if *req.ExpiresAt == "" {
+			update["expires_at"] = nil
+		} else {
+			t, err := time.Parse(time.RFC3339, *req.ExpiresAt)
+			if err != nil {
+				return fmt.Errorf("invalid expiresAt format, use RFC3339")
+			}
+			update["expires_at"] = t
+		}
 	}
 
 	if len(update) == 0 {

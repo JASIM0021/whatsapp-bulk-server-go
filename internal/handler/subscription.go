@@ -161,8 +161,18 @@ func (h *SubscriptionHandler) ValidatePromoCode(w http.ResponseWriter, r *http.R
 		respondError(w, "code is required", http.StatusBadRequest)
 		return
 	}
-	if plan != types.PlanMonthly && plan != types.PlanYearly {
-		respondError(w, "plan must be 'monthly' or 'yearly'", http.StatusBadRequest)
+	validPlans := map[string]bool{
+		types.PlanMonthly:        true,
+		types.PlanYearly:         true,
+		types.PlanStarter:        true,
+		types.PlanStarterYearly:  true,
+		types.PlanGrowth:         true,
+		types.PlanGrowthYearly:   true,
+		types.PlanBusiness:       true,
+		types.PlanBusinessYearly: true,
+	}
+	if !validPlans[plan] {
+		respondError(w, "invalid plan", http.StatusBadRequest)
 		return
 	}
 
@@ -172,6 +182,48 @@ func (h *SubscriptionHandler) ValidatePromoCode(w http.ResponseWriter, r *http.R
 		return
 	}
 	respondJSON(w, types.APIResponse{Success: true, Data: result})
+}
+
+// RazorpayVerify verifies a Razorpay payment and activates the subscription.
+// POST /api/payment/razorpay/verify — auth required.
+func (h *SubscriptionHandler) RazorpayVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	_, ok := middleware.GetUserID(r)
+	if !ok {
+		respondError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var req types.RazorpayVerifyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.RazorpayOrderID == "" || req.RazorpayPaymentID == "" || req.RazorpaySignature == "" || req.TxnID == "" {
+		respondError(w, "Missing required fields", http.StatusBadRequest)
+		return
+	}
+
+	txnID, err := h.subService.VerifyRazorpayPayment(r.Context(), req)
+	if err != nil {
+		logger.Error("Razorpay verification failed: %v", err)
+		respondError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	respondJSON(w, types.APIResponse{Success: true, Data: map[string]string{"txnId": txnID}})
+}
+
+// GetPaymentGateway returns the configured payment gateway name.
+// GET /api/payment/gateway — public endpoint.
+func (h *SubscriptionHandler) GetPaymentGateway(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	respondJSON(w, types.APIResponse{Success: true, Data: map[string]string{"gateway": h.subService.GetGateway()}})
 }
 
 // GetPaymentHistory returns the current user's payment history.

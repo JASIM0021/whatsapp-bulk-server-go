@@ -208,9 +208,12 @@ type CreatePromoCodeRequest struct {
 
 // UpdatePromoCodeRequest is the request body for updating a promo code
 type UpdatePromoCodeRequest struct {
-	IsActive      *bool    `json:"isActive,omitempty"`
-	MaxUses       *int     `json:"maxUses,omitempty"`
-	DiscountValue *float64 `json:"discountValue,omitempty"`
+	IsActive        *bool    `json:"isActive,omitempty"`
+	MaxUses         *int     `json:"maxUses,omitempty"`
+	DiscountType    *string  `json:"discountType,omitempty"`
+	DiscountValue   *float64 `json:"discountValue,omitempty"`
+	ApplicablePlans []string `json:"applicablePlans,omitempty"`
+	ExpiresAt       *string  `json:"expiresAt,omitempty"` // "" to clear, RFC3339 to set
 }
 
 // ValidatePromoResponse is the response for promo code validation
@@ -227,6 +230,7 @@ type ValidatePromoResponse struct {
 
 // PayUFormData is returned to frontend to build the hidden form POST to PayU
 type PayUFormData struct {
+	Gateway     string `json:"gateway"` // "payu"
 	Action      string `json:"action"`
 	Key         string `json:"key"`
 	TxnID       string `json:"txnid"`
@@ -243,6 +247,28 @@ type PayUFormData struct {
 	Udf3        string `json:"udf3"`
 	Udf4        string `json:"udf4"`
 	Udf5        string `json:"udf5"`
+}
+
+// RazorpayOrderData is returned to frontend for Razorpay checkout
+type RazorpayOrderData struct {
+	Gateway      string `json:"gateway"` // "razorpay"
+	OrderID      string `json:"orderId"`
+	Amount       int64  `json:"amount"` // in paise (INR × 100)
+	Currency     string `json:"currency"`
+	KeyID        string `json:"keyId"`
+	TxnID        string `json:"txnId"`
+	Description  string `json:"description"`
+	PrefillName  string `json:"prefillName"`
+	PrefillEmail string `json:"prefillEmail"`
+	PrefillPhone string `json:"prefillPhone"`
+}
+
+// RazorpayVerifyRequest is sent by frontend after Razorpay payment completes
+type RazorpayVerifyRequest struct {
+	RazorpayOrderID   string `json:"razorpayOrderId"`
+	RazorpayPaymentID string `json:"razorpayPaymentId"`
+	RazorpaySignature string `json:"razorpaySignature"`
+	TxnID             string `json:"txnId"`
 }
 
 // SavedContact represents a contact stored in the user's address book

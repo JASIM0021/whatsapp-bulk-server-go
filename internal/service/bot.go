@@ -179,9 +179,11 @@ func (s *BotService) HandleIncomingMessage(
 		return
 	}
 
-	// Check if sender is in the exclusion list
+	// Check if sender is in the exclusion list.
+	// Normalize both sides: stored numbers have no "+", but senderPhone arrives as "+91..."
+	normalizedSender := strings.TrimPrefix(strings.TrimSpace(senderPhone), "+")
 	for _, excluded := range cfg.ExcludedNumbers {
-		if strings.TrimSpace(excluded) == strings.TrimSpace(senderPhone) {
+		if strings.TrimPrefix(strings.TrimSpace(excluded), "+") == normalizedSender {
 			logger.Info("Bot: skipping auto-reply for excluded number %s (user %s)", senderPhone, userID)
 			return
 		}
