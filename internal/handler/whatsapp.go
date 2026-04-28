@@ -484,25 +484,44 @@ func (h *WhatsAppHandler) SendMessages(w http.ResponseWriter, r *http.Request) {
 		Errors: make([]string, 0),
 	}
 
+	consecutiveFails := 0
 	for i, contact := range req.Contacts {
 		progress.Current = &req.Contacts[i]
 
 		logger.Section(fmt.Sprintf("CONTACT %d/%d", i+1, len(req.Contacts)))
 		logger.WhatsAppSending(i+1, len(req.Contacts), contact.Name, contact.Phone)
 
-		// Random delay between 3-5 seconds between contacts (skip first)
+		// Random delay between 5-12 seconds between contacts (skip first).
+		// Extra backoff added after consecutive failures to avoid triggering rate limits.
 		if i > 0 {
-			delay := time.Duration(3000+rand.Intn(2000)) * time.Millisecond
-			logger.WhatsAppDelay(delay)
-			time.Sleep(delay)
+			baseDelay := time.Duration(5000+rand.Intn(7000)) * time.Millisecond
+			if consecutiveFails > 0 {
+				backoff := time.Duration(consecutiveFails) * 5 * time.Second
+				if backoff > 60*time.Second {
+					backoff = 60 * time.Second
+				}
+				baseDelay += backoff
+			}
+			logger.WhatsAppDelay(baseDelay)
+			time.Sleep(baseDelay)
+		}
+
+		// Cooldown break every 10 contacts to mimic natural human pausing.
+		if i > 0 && i%10 == 0 {
+			cooldown := time.Duration(45000+rand.Intn(45000)) * time.Millisecond
+			logger.Info("Anti-ban cooldown after %d contacts: %.0fs", i, cooldown.Seconds())
+			time.Sleep(cooldown)
 		}
 
 		contactFailed := false
 		for j, msg := range messages {
-			// Short delay between multiple messages to the same contact
+			// Delay between multiple messages to the same contact (2-4s).
 			if j > 0 {
-				time.Sleep(1 * time.Second)
+				time.Sleep(time.Duration(2000+rand.Intn(2000)) * time.Millisecond)
 			}
+
+			// Simulate typing before each message.
+			waService.SimulateTyping(contact.Phone)
 
 			text := strings.ReplaceAll(msg.Text, "{{name}}", contact.Name)
 			if msg.Link != "" {
@@ -529,9 +548,10 @@ func (h *WhatsAppHandler) SendMessages(w http.ResponseWriter, r *http.Request) {
 
 		if contactFailed {
 			progress.Failed++
+			consecutiveFails++
 		} else {
 			progress.Sent++
-			// Increment message count for free-plan users
+			consecutiveFails = 0
 			if h.subService != nil {
 				h.subService.IncrementMessageCount(r.Context(), userID, 1)
 			}

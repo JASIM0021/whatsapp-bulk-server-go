@@ -124,18 +124,32 @@ func (h *SchedulerHandler) runJob(job types.ScheduledJob) {
 
 	sent, failed := 0, 0
 	var errs []string
+	consecutiveFails := 0
 
 	for i, contact := range job.Contacts {
 		if i > 0 {
-			delay := time.Duration(3000+rand.Intn(2000)) * time.Millisecond
-			time.Sleep(delay)
+			baseDelay := time.Duration(5000+rand.Intn(7000)) * time.Millisecond
+			if consecutiveFails > 0 {
+				backoff := time.Duration(consecutiveFails) * 5 * time.Second
+				if backoff > 60*time.Second {
+					backoff = 60 * time.Second
+				}
+				baseDelay += backoff
+			}
+			time.Sleep(baseDelay)
+		}
+
+		// Cooldown break every 10 contacts.
+		if i > 0 && i%10 == 0 {
+			time.Sleep(time.Duration(45000+rand.Intn(45000)) * time.Millisecond)
 		}
 
 		contactFailed := false
 		for j, msg := range messages {
 			if j > 0 {
-				time.Sleep(1 * time.Second)
+				time.Sleep(time.Duration(2000+rand.Intn(2000)) * time.Millisecond)
 			}
+			waService.SimulateTyping(contact.Phone)
 			text := strings.ReplaceAll(msg.Text, "{{name}}", contact.Name)
 			if msg.Link != "" {
 				text += "\n\n" + msg.Link
@@ -155,8 +169,10 @@ func (h *SchedulerHandler) runJob(job types.ScheduledJob) {
 		}
 		if contactFailed {
 			failed++
+			consecutiveFails++
 		} else {
 			sent++
+			consecutiveFails = 0
 			if h.subService != nil {
 				h.subService.IncrementMessageCount(ctx, job.UserID, 1)
 			}

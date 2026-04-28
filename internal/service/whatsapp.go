@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -815,6 +816,31 @@ func (s *WhatsAppService) Disconnect() {
 func (s *WhatsAppService) SendWithDelay(phone, message string, delay time.Duration) error {
 	time.Sleep(delay)
 	return s.SendMessage(phone, message)
+}
+
+// SimulateTyping sends a composing indicator to the given phone number for a
+// random 1-3 second duration, then sends a paused indicator. This mimics
+// human typing behavior and reduces the likelihood of WhatsApp flagging the
+// account as a bot during bulk sends.
+func (s *WhatsAppService) SimulateTyping(phone string) {
+	s.mu.RLock()
+	client := s.client
+	ready := s.isReady
+	s.mu.RUnlock()
+
+	if !ready || client == nil || !client.IsConnected() {
+		return
+	}
+
+	jid, _, err := s.parseAndNormalizePhone(phone)
+	if err != nil {
+		return
+	}
+
+	ctx := context.Background()
+	_ = client.SendChatPresence(ctx, jid, types.ChatPresenceComposing, types.ChatPresenceMediaText)
+	time.Sleep(time.Duration(1000+rand.Intn(2000)) * time.Millisecond)
+	_ = client.SendChatPresence(ctx, jid, types.ChatPresencePaused, types.ChatPresenceMediaText)
 }
 
 func (s *WhatsAppService) SendMessageWithImage(phone, message, imagePath string) error {

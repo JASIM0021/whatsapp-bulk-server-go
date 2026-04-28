@@ -121,12 +121,27 @@ func (h *ExternalAPIHandler) Send(w http.ResponseWriter, r *http.Request) {
 
 	sent, failed := 0, 0
 	var errs []string
+	consecutiveFails := 0
 
 	for i, c := range contacts {
 		if i > 0 {
-			delay := time.Duration(3000+rand.Intn(2000)) * time.Millisecond
-			time.Sleep(delay)
+			baseDelay := time.Duration(5000+rand.Intn(7000)) * time.Millisecond
+			if consecutiveFails > 0 {
+				backoff := time.Duration(consecutiveFails) * 5 * time.Second
+				if backoff > 60*time.Second {
+					backoff = 60 * time.Second
+				}
+				baseDelay += backoff
+			}
+			time.Sleep(baseDelay)
 		}
+
+		// Cooldown break every 10 contacts.
+		if i > 0 && i%10 == 0 {
+			time.Sleep(time.Duration(45000+rand.Intn(45000)) * time.Millisecond)
+		}
+
+		waService.SimulateTyping(c.Phone)
 
 		text := req.Message.Text
 		if c.Name != "" {
@@ -142,9 +157,11 @@ func (h *ExternalAPIHandler) Send(w http.ResponseWriter, r *http.Request) {
 
 		if sendErr != nil {
 			failed++
+			consecutiveFails++
 			errs = append(errs, c.Phone+": "+sendErr.Error())
 		} else {
 			sent++
+			consecutiveFails = 0
 		}
 	}
 
